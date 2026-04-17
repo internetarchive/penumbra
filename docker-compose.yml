@@ -1,0 +1,49 @@
+services:
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"   # management UI: http://localhost:15672 (guest/guest)
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  penumbra:
+    build: .
+    environment:
+      PENUMBRA_AMQP_URL: "amqp://guest:guest@rabbitmq:5672/%2f"
+      PENUMBRA_AMQP_QUEUE_NAME: "penumbra_urls"
+      PENUMBRA_AMQP_ROUTING_KEY: "penumbra_urls"
+      PENUMBRA_AMQP_EXCHANGE_NAME: "penumbra_exchange"
+      PENUMBRA_METRICS_ENABLED: "true"
+      PENUMBRA_METRICS_PORT: "8888"
+    ports:
+      - "8888:8888"     # Prometheus metrics
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  heritrix:
+    image: iipc/heritrix:contrib
+    environment:
+      USERNAME: admin
+      PASSWORD: admin
+    ports:
+      - "8443:8443"     # web UI: https://localhost:8443 (admin/admin, self-signed cert)
+    volumes:
+      - "./heritrix/jobs:/opt/heritrix/jobs"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus
+    volumes:
+      - "./prometheus.yml:/etc/prometheus/prometheus.yml"
+    ports:
+      - "9090:9090"
+    depends_on:
+      - penumbra
