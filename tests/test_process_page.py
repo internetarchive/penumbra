@@ -1,17 +1,18 @@
-from unittest.mock import AsyncMock, patch
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import aio_pika
 import pytest
 from playwright.async_api import async_playwright
-from prometheus_client import REGISTRY, Counter
+from prometheus_client import REGISTRY
 
-from penumbra import metrics, models
-from penumbra.models import UmbraMessage
 from penumbra.queues import AsyncMessageClient
 from penumbra.worker import Settings, process_page
 
 
-def message_maker(url: str) -> UmbraMessage:
-    return models.UmbraMessage(
+def message_maker(url: str) -> MagicMock:
+    message = MagicMock(spec=aio_pika.IncomingMessage)
+    message.body = json.dumps(
         {
             "url": url,
             "metadata": {
@@ -22,7 +23,8 @@ def message_maker(url: str) -> UmbraMessage:
             },
             "clientId": "urls",
         }
-    )
+    ).encode()
+    return message
 
 
 @pytest.mark.asyncio
@@ -53,7 +55,7 @@ async def test_process_page(monkeypatch):
             )
             monkeypatch.setenv("penumbra_skip_resource_document", "1")
             settings = Settings()
-            assert settings.skip_resource_document == True
+            assert settings.skip_resource_document
             await process_page(client, browser, message)
             requested_docs_post = REGISTRY.get_sample_value(
                 "penumbra_resources_requested_total", {"resource_type": "document"}
