@@ -16,6 +16,26 @@ class Settings(BaseSettings):
     amqp_queue_name: str = Field(default="urls")
     amqp_routing_key: str = Field(default="urls")
     amqp_exchange_name: str = Field(default="umbra")
+    amqp_connect_timeout_seconds: float = Field(default=60.0, gt=0)
+    # Heritrix rejects URLs longer than its UURI limit (2083 chars), so drop
+    # over-length URLs before enqueueing rather than publishing dead links.
+    max_url_length: int = Field(default=2083, ge=1)
+    # Nothing in `process_page` except `page.goto()` carries a deadline of its
+    # own: Playwright's protocol calls and aio-pika's publish/ack all block
+    # indefinitely. A single wedged browser or blocked broker connection would
+    # otherwise pin a task for the life of the process.
+    # Every await is bounded by one of these.
+    page_timeout_seconds: float = Field(default=120.0, gt=0)
+    context_close_timeout_seconds: float = Field(default=30.0, gt=0)
+    amqp_ack_timeout_seconds: float = Field(default=30.0, gt=0)
+    publish_timeout_seconds: float = Field(default=30.0, gt=0)
+    publish_max_attempts: int = Field(default=3, ge=1)
+    publish_retry_base_delay_seconds: float = Field(default=0.5, gt=0)
+    # Warn when pages are in flight but none are completing. A stalled instance
+    # keeps running, so systemd sees a healthy unit and nothing else in the log
+    # says anything is wrong.
+    stall_warning_seconds: float = Field(default=3600.0, gt=0)
+    stall_check_interval_seconds: float = Field(default=300.0, gt=0)
     install_playwright: bool = Field(default=True)
     skip_resource_document: bool = Field(default=False)
     skip_resource_stylesheet: bool = Field(default=False)
@@ -34,6 +54,27 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", env_prefix="penumbra_"
     )
+
+    @computed_field
+    @cached_property
+    def max_concurrency(self) -> int:
+        """Concurrent page tasks, and therefore the AMQP prefetch count."""
+        return self.browser_pool_size * self.contexts_per_browser
+
+    @computed_field
+    @cached_property
+    def task_timeout_seconds(self) -> float:
+        """
+        Backstop deadline for a whole page task, covering the page timeout plus
+        the bounded cleanup that runs after it fires. Only reached if one of the
+        inner deadlines fails to do its job.
+        """
+        return (
+            self.page_timeout_seconds
+            + self.context_close_timeout_seconds
+            + self.amqp_ack_timeout_seconds
+            + 30.0
+        )
 
     @computed_field
     @cached_property
