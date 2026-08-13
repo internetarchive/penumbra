@@ -2,7 +2,7 @@ from dataclasses import asdict, dataclass
 from functools import cached_property
 from typing import Literal
 
-from pydantic import Field, computed_field
+from pydantic import Field, computed_field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,7 +26,20 @@ class Settings(BaseSettings):
     # otherwise pin a task for the life of the process.
     # Every await is bounded by one of these.
     page_timeout_seconds: float = Field(default=120.0, gt=0)
+    # How long `page.goto` gets. Defaults to Playwright's own 30s, which is what
+    # penumbra used implicitly before this was exposed. Exceeding it is treated
+    # as the site's failure and the URL is dropped, so this is the line between
+    # "too slow to be worth crawling" and "worth another attempt" -- and it has
+    # to stay below `page_timeout_seconds` to mean anything. See the validator.
+    navigation_timeout_seconds: float = Field(default=30.0, gt=0)
     context_close_timeout_seconds: float = Field(default=30.0, gt=0)
+    # Returning a page's links to Heritrix. Deliberately outside the page
+    # deadline, so a slow broker is not charged to the page and misreported as a
+    # page timeout -- which means it needs a bound of its own. Publishes run
+    # concurrently and each is already bounded by `publish_timeout_seconds` with
+    # `publish_max_attempts` retries, so the natural worst case is around 92s;
+    # this sits above that as a backstop rather than a limiter.
+    outlink_publish_timeout_seconds: float = Field(default=120.0, gt=0)
     amqp_ack_timeout_seconds: float = Field(default=30.0, gt=0)
     publish_timeout_seconds: float = Field(default=30.0, gt=0)
     publish_max_attempts: int = Field(default=3, ge=1)
@@ -55,6 +68,30 @@ class Settings(BaseSettings):
         env_file=".env", env_file_encoding="utf-8", env_prefix="penumbra_"
     )
 
+    @model_validator(mode="after")
+    def _navigation_timeout_fits_inside_page_deadline(self) -> "Settings":
+        """
+        Refuse to start when the navigation timeout cannot fire.
+
+        The page deadline starts first and covers the navigation along with
+        everything around it, so at equal values it always wins the race. That
+        inverts the failure classification silently: a slow page raises the
+        builtin TimeoutError of our own deadline instead of Playwright's, which
+        classifies as `page_timeout` and is requeued rather than dropped -- the
+        hot loop the classification exists to prevent. Nothing about that shows
+        up in the logs, so it fails loudly here instead. Leave real headroom,
+        not a second: the gap also absorbs context setup, publishing and the ack.
+        """
+        if self.navigation_timeout_seconds >= self.page_timeout_seconds:
+            raise ValueError(
+                f"navigation_timeout_seconds ({self.navigation_timeout_seconds}) must "
+                f"be less than page_timeout_seconds ({self.page_timeout_seconds}), and "
+                "wants headroom for context setup, publishing and the ack on top. "
+                "Otherwise the page deadline always fires first and pages that are "
+                "merely slow are requeued forever instead of dropped."
+            )
+        return self
+
     @computed_field
     @cached_property
     def max_concurrency(self) -> int:
@@ -71,6 +108,7 @@ class Settings(BaseSettings):
         """
         return (
             self.page_timeout_seconds
+            + self.outlink_publish_timeout_seconds
             + self.context_close_timeout_seconds
             + self.amqp_ack_timeout_seconds
             + 30.0

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import signal
 from contextlib import suppress
 from itertools import cycle
@@ -8,9 +9,12 @@ from itertools import cycle
 # `time` below is prometheus_async's decorator, not the stdlib module, so import
 # the clock we need by name.
 from time import monotonic
+from typing import NamedTuple
 
 import aio_pika
 from playwright.async_api import Browser, Request, Response, Route, async_playwright
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from prometheus_async.aio import time, track_inprogress
 
 from penumbra import metrics
@@ -179,17 +183,168 @@ async def robust_context_close(context) -> None:
         logger.warning("Failed to close browser context", exc_info=e)
 
 
+# Chromium reports navigation failures as `net::ERR_...` inside the Playwright
+# error message; there is no structured field to read it from.
+NET_ERROR_PATTERN = re.compile(r"net::(ERR_[A-Z0-9_]+)")
+
+# The net errors that describe our side of the wire rather than the remote site.
+# Everything else `net::` reports -- expired certs, name mismatches, refused
+# connections, NXDOMAIN -- is a property of the site and will still be true on
+# redelivery, so those pages are dropped instead of requeued.
+TRANSIENT_NET_ERRORS = frozenset(
+    {
+        "ERR_INTERNET_DISCONNECTED",
+        "ERR_NETWORK_CHANGED",
+        "ERR_NETWORK_IO_SUSPENDED",
+        "ERR_PROXY_CONNECTION_FAILED",
+        "ERR_TUNNEL_CONNECTION_FAILED",
+    }
+)
+
+
+class PageFailure(NamedTuple):
+    """
+    What a page that did not load cleanly is worth.
+
+    `reason` doubles as the metric label, so it stays a bounded set: a net error
+    code, a fixed string, or an exception class name.
+
+    `publish` means the requests the page made before it stopped are real links,
+    worth returning to Heritrix. Only timeouts qualify: everything else failed
+    at connect or TLS, so the one request that fired is the URL Heritrix just
+    handed us.
+
+    `requeue` sends the message back for another attempt. Reserved for failures
+    that say nothing about the URL -- our connectivity, our browser handle, our
+    broker. Requeueing anything else is what turned a handful of sites with bad
+    certificates into a hot loop: the failure takes milliseconds, the message
+    goes straight back to the head of the queue, and the same URLs occupy every
+    prefetch slot indefinitely while the real backlog waits. Acking costs
+    nothing a redelivery would have recovered, because Heritrix fetches the URL
+    itself regardless of what penumbra reports -- our only contribution is the
+    links, and we have already published whatever there was.
+    """
+
+    reason: str
+    requeue: bool
+    publish: bool
+
+
+def classify_page_failure(e: Exception, deadline_expired: bool) -> PageFailure:
+    """Decide what a page that did not load cleanly is worth."""
+    # Checked before PlaywrightError, which it subclasses. `page.goto` had the
+    # full navigation timeout, but the requests it fired along the way are real
+    # links, so they are kept rather than discarded.
+    if isinstance(e, PlaywrightTimeoutError):
+        return PageFailure("navigation_timeout", requeue=False, publish=True)
+    if isinstance(e, PlaywrightError):
+        match = NET_ERROR_PATTERN.search(str(e))
+        if match:
+            code = match.group(1)
+            return PageFailure(code, code in TRANSIENT_NET_ERRORS, publish=False)
+        # A Playwright error with no net:: code is about the browser, not the
+        # page -- a closed context or a dead target. Ours to retry.
+        return PageFailure(type(e).__name__, requeue=True, publish=False)
+    # Our own page deadline. Only it actually expiring counts: the builtin
+    # TimeoutError is an OSError subclass that aio-pika also raises from a
+    # socket operation.
+    #
+    # Spending the full budget on a page is a result, not a failure -- we did as
+    # much as we were willing to, so the links go out and the page is done.
+    # Terminal even when the page reached nothing: having already spent the
+    # budget once is reason enough not to spend it again on a redelivery.
+    if isinstance(e, TimeoutError) and deadline_expired:
+        return PageFailure("page_timeout", requeue=False, publish=True)
+    return PageFailure(type(e).__name__, requeue=True, publish=False)
+
+
+async def publish_outlinks(
+    client: AsyncMessageClient, message: UmbraMessage, page_requests: set[str]
+) -> bool:
+    """
+    Return a page's links to Heritrix. Returns True if they all went out.
+
+    Bounded here rather than by the page deadline, so that a slow broker is
+    charged to the broker instead of being misreported as a slow page. Never
+    raises: failing to deliver the links must still let the message be settled
+    and the slot freed, and `publish_with_retry` has already counted whatever it
+    dropped.
+    """
+    try:
+        async with asyncio.timeout(settings.outlink_publish_timeout_seconds):
+            await publish_umbra_response(client, message, page_requests)
+        return True
+    except Exception as e:
+        logger.error(
+            "Failed to publish %d URLs from %s",
+            len(page_requests),
+            message.url,
+            exc_info=e,
+        )
+        return False
+
+
+def log_page_failure(
+    failure: PageFailure, message: UmbraMessage, page_requests: set[str], e: Exception
+) -> None:
+    """Report a page that did not load cleanly, at a level matching how bad it is."""
+    if failure.publish and page_requests:
+        logger.info(
+            "Ran out of time on %s (%s); keeping the %d URLs it reached and "
+            "treating the page as done",
+            message.url,
+            failure.reason,
+            len(page_requests),
+        )
+    elif failure.reason == "page_timeout":
+        # Terminal by policy, so this is a page given up on with nothing to show
+        # for it. Spending the whole budget without a single request firing
+        # points at the browser rather than the site, and there is no redelivery
+        # left to make that visible -- so say so here, and watch
+        # penumbra_pages_failed{reason="page_timeout"} for the pool going bad.
+        logger.warning(
+            "Page deadline expired on %s before any request was made; giving up "
+            "on it with no links. That usually means the browser rather than "
+            "the site.",
+            message.url,
+        )
+    elif not failure.requeue:
+        # No traceback: these are expected, fully described by the reason, and
+        # numerous enough that stack traces would bury everything else. The
+        # per-reason counter is what to watch, not the log.
+        logger.info("Unreachable page (%s): %s", failure.reason, message.url)
+    else:
+        logger.warning("Exception while processing page: %s", message.url, exc_info=e)
+
+
+async def robust_ack(raw_message: aio_pika.IncomingMessage, url: str) -> None:
+    """
+    Settle a message we are done with, so it leaves the queue.
+
+    Bounded and never raising for the same reason as `robust_nack`: the broker
+    is one of the things that can be broken here, so the ack cannot be trusted
+    to return, and a page task must not be held up by it either way. A lost ack
+    costs one redelivery.
+    """
+    try:
+        async with asyncio.timeout(settings.amqp_ack_timeout_seconds):
+            await raw_message.ack()
+    except Exception as e:
+        logger.error("Failed to ack %s", url, exc_info=e)
+
+
 async def robust_nack(raw_message: aio_pika.IncomingMessage, url: str) -> None:
     """
     Return a message to the queue for redelivery.
-
-    Only safe to call when no ack has been attempted for this delivery tag; see
-    `ack_attempted` in `process_page`.
 
     Bounded separately from the page deadline: a blocked AMQP connection is one
     of the reasons we end up here, so the nack itself cannot be trusted to
     return. Losing the nack costs a redelivery, which the broker will do anyway
     once the consumer goes away.
+
+    Exclusive with `robust_ack` -- `process_page` calls exactly one of them, and
+    never a nack after an ack. Nacking a delivery tag whose ack is already on
+    the wire earns a PRECONDITION_FAILED that closes the consume channel.
     """
     try:
         async with asyncio.timeout(settings.amqp_ack_timeout_seconds):
@@ -233,68 +388,67 @@ async def process_page(
     raw_message: aio_pika.IncomingMessage,
 ):
     """
-    `process_page` interacts with a page in a browser and publishes any URLs it finds
-    back to Heritrix for potential crawling.
+    Crawl one page and return the URLs it requested to Heritrix.
 
-    The whole body runs under a deadline. Only `page.goto()` has a timeout of its
-    own; `new_context`, `new_page` and `route` are untimed Playwright protocol
-    calls, and the publish/ack are untimed AMQP round trips. Any of them can
-    block forever against a wedged browser or a blocked broker connection, which
-    is how a task -- and one of only
+    The page deadline covers the browser work only. `new_context`, `new_page`
+    and `route` are untimed Playwright protocol calls that block forever against
+    a wedged browser, which is how a task -- and one of only
     `browser_pool_size * contexts_per_browser` semaphore permits -- gets stuck
     for the life of the process.
+
+    Publishing and settling the message happen afterwards, once, on the same
+    path whether or not the page loaded: a page that ran out of time still fired
+    real requests, and those links are worth exactly as much as any others.
+    Keeping them outside the page deadline also means a slow broker is charged
+    to the broker rather than misreported as a slow page, and that the ack
+    cannot be interrupted part-way. An interrupted `ack()` is the nastier
+    failure: it leaves the Basic.Ack frame on the wire with the message still
+    marked unprocessed, and nacking that delivery tag earns a
+    PRECONDITION_FAILED that closes the consume channel and stops this instance
+    consuming at all.
     """
     message = UmbraMessage(json.loads(raw_message.body))
     context = None
-    # Set before the ack, not after: `ack()` hands the Basic.Ack frame to the
-    # socket and only marks the message processed once the drain returns, so a
-    # deadline landing on that drain leaves `raw_message.processed` False with the
-    # ack already on the wire. Nacking that delivery tag earns a
-    # PRECONDITION_FAILED that closes the consume channel and stops this instance
-    # consuming at all, so once this is set the nack has to be skipped.
-    ack_attempted = False
+    # The `request` handler mutates this in place, so whatever the page reached
+    # before it stopped is still here afterwards.
+    page_requests: set[str] = set()
+    failure: PageFailure | None = None
     deadline = asyncio.timeout(settings.page_timeout_seconds)
     try:
         async with deadline:
             context = await browser.new_context()
-            page_requests = set()
             page = await context.new_page()
             await page.route("**/*", handle_route)
             page.on("request", lambda request: page_requests.add(request.url))
             page.on("requestfinished", handle_request_finished)
-            await page.goto(message.url)
-            await publish_umbra_response(client, message, page_requests)
-            ack_attempted = True
-            await raw_message.ack()
-            update_metrics(page_requests)
+            # Playwright takes milliseconds.
+            await page.goto(
+                message.url, timeout=settings.navigation_timeout_seconds * 1000
+            )
     except Exception as e:
-        # Playwright's TimeoutError is its own class, but the builtin one that
-        # `asyncio.timeout` raises is an OSError subclass that aio-pika can also
-        # raise from a socket operation. `deadline.expired()` is what actually
-        # distinguishes our deadline from an unrelated timeout, so a slow socket
-        # is not miscounted as a page that outran its budget.
-        if isinstance(e, TimeoutError) and deadline.expired():
-            logger.error(
-                "Timed out after %ss while processing page: %s",
-                settings.page_timeout_seconds,
-                message.url,
-            )
+        failure = classify_page_failure(e, deadline.expired())
+        if failure.reason == "page_timeout":
             metrics.penumbra_page_timeouts.inc(1)
-        else:
-            logger.warning(
-                "Exception while processing page: %s", message.url, exc_info=e
-            )
-        if ack_attempted:
-            logger.warning(
-                "Not nacking %s: its ack may already be on the wire. The broker "
-                "will redeliver if it did not land.",
-                message.url,
-            )
-        else:
-            await robust_nack(raw_message, message.url)
+        metrics.penumbra_pages_failed.labels(failure.reason).inc(1)
+        log_page_failure(failure, message, page_requests, e)
     finally:
+        # Closed before publishing, so a browser context is not held open across
+        # what can be a slow AMQP round trip.
         if context is not None:
             await robust_context_close(context)
+
+    # An empty set is not a result, it is nothing: skip the publish rather than
+    # counting a page that reached nothing as crawled. Any page that got as far
+    # as `goto` has at least its own request in here, so this only catches the
+    # page deadline firing during context setup.
+    if page_requests and (failure is None or failure.publish):
+        if await publish_outlinks(client, message, page_requests):
+            update_metrics(page_requests)
+
+    if failure is not None and failure.requeue:
+        await robust_nack(raw_message, message.url)
+    else:
+        await robust_ack(raw_message, message.url)
 
 
 def ensure_playwright_installed():
