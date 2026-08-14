@@ -10,6 +10,7 @@ from itertools import cycle
 # the clock we need by name.
 from time import monotonic
 from typing import NamedTuple
+from urllib.parse import urlsplit, urlunsplit
 
 import aio_pika
 from playwright.async_api import Browser, Request, Response, Route, async_playwright
@@ -127,8 +128,51 @@ async def publish_umbra_response(
             tg.create_task(publish_with_retry(client, umbra_response))
 
 
+def canonical_url(url: str) -> str:
+    """
+    Canonicalise just enough to recognise a page among its own requests.
+
+    Chromium asks for a normalised form of what it was given: a bare host gains
+    a trailing slash, the host is lowercased, and the fragment is never sent. So
+    comparing raw strings misses the very URL we are trying to match.
+
+    Deliberately minimal, and only ever used for that one comparison. Path and
+    query keep their case because they are case-sensitive, and the only URLs
+    this can conflate are ones that address the same resource anyway.
+    """
+    parts = urlsplit(url)
+    return urlunsplit(
+        (parts.scheme.lower(), parts.netloc.lower(), parts.path or "/", parts.query, "")
+    )
+
+
+def outlinks_from(page_requests: set[str], page_url: str) -> set[str]:
+    """
+    The links a page discovered: everything it requested except itself.
+
+    Its own URL is always in there, and Heritrix is where it came from --
+    returning it is a no-op the frontier has to dedupe away. Anything it
+    redirected through on the way is a real discovery and stays.
+    """
+    page = canonical_url(page_url)
+    return {url for url in page_requests if canonical_url(url) != page}
+
+
 def update_metrics(urls: set[str]) -> None:
-    """Update `process_page` Prometheus metrics."""
+    """
+    Record one crawled page and whatever links it found.
+
+    Called for every message we take off the queue and attempt, however it went.
+    A site that was offline, served a bad certificate or timed out is still a
+    page that was crawled -- that result is the state of the site at archive
+    time, not a non-event. `penumbra_pages_failed` is where the breakdown lives;
+    counting only the pages that loaded would make this a measure of the web's
+    health rather than of penumbra's throughput.
+
+    `last_completion` follows the same rule, and that is what makes
+    `warn_if_stalled` mean something: it fires only when page tasks stop
+    finishing altogether, rather than whenever a run of URLs happens to be bad.
+    """
     global last_completion
     metrics.penumbra_last_page_crawled_time.set_to_current_time()
     metrics.penumbra_pages_crawled.inc(1)
@@ -238,6 +282,17 @@ def classify_playwright_message(text: str) -> tuple[str, bool]:
     return UNKNOWN_PLAYWRIGHT_ERROR
 
 
+class PageLoadTimeout(Exception):
+    """
+    The document committed but its subresources never finished.
+
+    Both crawl phases raise Playwright's `TimeoutError`, so the second one is
+    re-raised as this to keep them apart. Carrying the phase in the exception
+    type rather than in a variable keeps `classify_page_failure` a function of
+    the exception alone.
+    """
+
+
 class PageFailure(NamedTuple):
     """
     What a page that did not load cleanly is worth.
@@ -269,9 +324,13 @@ class PageFailure(NamedTuple):
 
 def classify_page_failure(e: Exception, deadline_expired: bool) -> PageFailure:
     """Decide what a page that did not load cleanly is worth."""
-    # Checked before PlaywrightError, which it subclasses. `page.goto` had the
-    # full navigation timeout, but the requests it fired along the way are real
-    # links, so they are kept rather than discarded.
+    # Phase 2: committed, but the subresources never finished. The requests it
+    # did fire are real links, so they are kept rather than discarded. Spending
+    # the whole budget on a page is a result, not a failure.
+    if isinstance(e, PageLoadTimeout):
+        return PageFailure("page_timeout", retryable=False, publish=True)
+    # Phase 1, checked before PlaywrightError which it subclasses: the server
+    # never answered. Nothing loaded, but keep whatever did fire.
     if isinstance(e, PlaywrightTimeoutError):
         return PageFailure("navigation_timeout", retryable=False, publish=True)
     if isinstance(e, PlaywrightError):
@@ -285,16 +344,15 @@ def classify_page_failure(e: Exception, deadline_expired: bool) -> PageFailure:
         # here is what put the cert errors into a hot loop.
         slug, retryable = classify_playwright_message(str(e))
         return PageFailure(slug, retryable, publish=False)
-    # Our own page deadline. Only it actually expiring counts: the builtin
-    # TimeoutError is an OSError subclass that aio-pika also raises from a
-    # socket operation.
+    # The outer backstop. Both phases are bounded on their own, so reaching this
+    # means one of the untimed protocol calls hung -- a wedged browser, not a
+    # slow site. Terminal anyway: a redelivery would spend the budget again, and
+    # `enable_page_retries` is the switch for taking that bet.
     #
-    # Spending the full budget on a page is a result, not a failure -- we did as
-    # much as we were willing to, so the links go out and the page is done.
-    # Terminal even when the page reached nothing: having already spent the
-    # budget once is reason enough not to spend it again on a redelivery.
+    # Only the deadline actually expiring counts: the builtin TimeoutError is an
+    # OSError subclass that aio-pika also raises from a socket operation.
     if isinstance(e, TimeoutError) and deadline_expired:
-        return PageFailure("page_timeout", retryable=False, publish=True)
+        return PageFailure("browser_stuck", retryable=False, publish=True)
     return PageFailure(type(e).__name__, retryable=True, publish=False)
 
 
@@ -325,27 +383,27 @@ async def publish_outlinks(
 
 
 def log_page_failure(
-    failure: PageFailure, message: UmbraMessage, page_requests: set[str], e: Exception
+    failure: PageFailure, message: UmbraMessage, outlinks: set[str], e: Exception
 ) -> None:
     """Report a page that did not load cleanly, at a level matching how bad it is."""
-    if failure.publish and page_requests:
+    if failure.publish and outlinks:
         logger.info(
-            "Ran out of time on %s (%s); keeping the %d URLs it reached and "
+            "Ran out of time on %s (%s); keeping the %d links it found and "
             "treating the page as done",
             message.url,
             failure.reason,
-            len(page_requests),
+            len(outlinks),
         )
-    elif failure.reason == "page_timeout":
-        # Terminal by policy, so this is a page given up on with nothing to show
-        # for it. Spending the whole budget without a single request firing
-        # points at the browser rather than the site, and there is no redelivery
-        # left to make that visible -- so say so here, and watch
-        # penumbra_pages_failed{reason="page_timeout"} for the pool going bad.
+    elif failure.reason == "browser_stuck":
+        # Both crawl phases are bounded on their own, so the outer deadline
+        # firing means an untimed protocol call hung. Nothing was retried and
+        # nothing was published, so this line and
+        # penumbra_pages_failed{reason="browser_stuck"} are the only signs the
+        # pool has gone bad.
         logger.warning(
-            "Page deadline expired on %s before any request was made; giving up "
-            "on it with no links. That usually means the browser rather than "
-            "the site.",
+            "Browser deadline expired on %s before the crawl phases could even "
+            "run; giving up on it with no links. That is the browser rather "
+            "than the site.",
             message.url,
         )
     elif not failure.retryable:
@@ -430,11 +488,18 @@ async def process_page(
     """
     Crawl one page and return the URLs it requested to Heritrix.
 
-    The page deadline covers the browser work only. `new_context`, `new_page`
-    and `route` are untimed Playwright protocol calls that block forever against
-    a wedged browser, which is how a task -- and one of only
-    `browser_pool_size * contexts_per_browser` semaphore permits -- gets stuck
-    for the life of the process.
+    The crawl runs in two phases, each with its own timeout: navigate until the
+    server answers and the document commits, then wait for its subresources to
+    finish. Sequential rather than nested, so the two budgets are independent
+    and the worst case is their sum. Splitting them also separates "we could not
+    reach this at all" from "it never finished rendering", which a single
+    timeout around both cannot tell apart.
+
+    The browser deadline wraps both as a backstop, because `new_context`,
+    `new_page` and `route` are untimed Playwright protocol calls that block
+    forever against a wedged browser -- which is how a task, and one of only
+    `browser_pool_size * contexts_per_browser` semaphore permits, gets stuck for
+    the life of the process.
 
     Publishing and settling the message happen afterwards, once, on the same
     path whether or not the page loaded: a page that ran out of time still fired
@@ -453,53 +518,60 @@ async def process_page(
     # before it stopped is still here afterwards.
     page_requests: set[str] = set()
     failure: PageFailure | None = None
-    deadline = asyncio.timeout(settings.page_timeout_seconds)
+    failure_exc: Exception | None = None
+    deadline = asyncio.timeout(settings.browser_deadline_seconds)
     try:
         async with deadline:
-            # A URL that serves a download still fails the navigation either
-            # way ("Download is starting"), but accepting it writes roughly
-            # twice the file size into the browser's temp dir until the context
-            # closes -- and TMPDIR is /dev/shm in production, so that is RAM,
-            # times `browser_pool_size` concurrent pages. We cannot extract
-            # links from the bytes anyway.
             context = await browser.new_context(accept_downloads=False)
             page = await context.new_page()
             await page.route("**/*", handle_route)
             page.on("request", lambda request: page_requests.add(request.url))
             page.on("requestfinished", handle_request_finished)
-            # Playwright takes milliseconds.
+            # Phase 1. `commit` returns as soon as the server has answered and
+            # the navigation is committed.
             await page.goto(
-                message.url, timeout=settings.navigation_timeout_seconds * 1000
+                message.url,
+                wait_until="commit",
+                timeout=settings.navigation_timeout_seconds * 1000,
             )
+            # Phase 2, on its own budget. Re-raised as `PageLoadTimeout` so it
+            # is not mistaken for the navigation timing out: Playwright raises
+            # the same exception type for both.
+            try:
+                await page.wait_for_load_state(
+                    "load", timeout=settings.page_timeout_seconds * 1000
+                )
+            except PlaywrightTimeoutError as e:
+                raise PageLoadTimeout(message.url) from e
     except Exception as e:
         failure = classify_page_failure(e, deadline.expired())
-        if failure.reason == "page_timeout":
-            metrics.penumbra_page_timeouts.inc(1)
-        metrics.penumbra_pages_failed.labels(failure.reason).inc(1)
-        log_page_failure(failure, message, page_requests, e)
+        failure_exc = e
     finally:
         # Closed before publishing, so a browser context is not held open across
         # what can be a slow AMQP round trip.
         if context is not None:
             await robust_context_close(context)
 
-    # An empty set is not a result, it is nothing: skip the publish rather than
-    # counting a page that reached nothing as crawled. Any page that got as far
-    # as `goto` has at least its own request in here, so this only catches the
-    # page deadline firing during context setup.
-    if page_requests and (failure is None or failure.publish):
-        if await publish_outlinks(client, message, page_requests):
-            update_metrics(page_requests)
+    outlinks = outlinks_from(page_requests, message.url)
 
-    # Policy is applied here rather than in the classification, so
-    # `failure.retryable` stays a statement about the failure and this stays a
-    # statement about what we do with it. Off by default, so the normal path
-    # settles every message exactly once; `log_page_failure` has already
-    # reported anything retryable that is being given up on.
+    if failure is not None:
+        if failure.reason == "page_timeout":
+            metrics.penumbra_page_timeouts.inc(1)
+        metrics.penumbra_pages_failed.labels(failure.reason).inc(1)
+        log_page_failure(failure, message, outlinks, failure_exc)
+
+    if outlinks and (failure is None or failure.publish):
+        await publish_outlinks(client, message, outlinks)
+
     if failure is not None and failure.retryable and settings.enable_page_retries:
         await robust_nack(raw_message, message.url)
     else:
         await robust_ack(raw_message, message.url)
+
+    # Unconditional, and last: we took this message off the queue and are done
+    # with it. Whether the page loaded, timed out or was never reachable, the
+    # attempt is the unit being counted.
+    update_metrics(outlinks)
 
 
 def ensure_playwright_installed():
@@ -520,9 +592,6 @@ async def main():
     ch.setFormatter(formatter)
     logger.addHandler(ch)
 
-    # Warned once at startup rather than per page: with retries on this fires on
-    # every retryable failure, and the thing worth knowing is that the instance
-    # is running in this mode at all.
     if settings.enable_page_retries:
         logger.warning(
             "enable_page_retries is on. This is EXPERIMENTAL: a requeued message "

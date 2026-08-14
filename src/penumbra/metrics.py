@@ -1,7 +1,7 @@
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 # fmt: off
-penumbra_pages_crawled = Counter("penumbra_pages_crawled", "number of pages visited by penumbra")
+penumbra_pages_crawled = Counter("penumbra_pages_crawled", "pages penumbra has taken off the queue and attempted, however they turned out; a site that was offline or timed out is still a crawl result, and penumbra_pages_failed carries the breakdown")
 penumbra_urls_found = Counter("penumbra_urls_found", "number of URLs extracted by penumbra")
 penumbra_urls_dropped_too_long = Counter("penumbra_urls_dropped_too_long", "number of URLs dropped for exceeding the max URL length before publishing")
 penumbra_page_processing_duration_seconds = Histogram("penumbra_page_processing_duration_seconds", "time spent processing a page in penumbra")
