@@ -210,12 +210,13 @@ TRANSIENT_NET_ERRORS = frozenset(
 # raw message -- some of these embed URLs ("Navigation to X is interrupted by
 # another navigation to Y"), which would give the label unbounded cardinality.
 #
-# Requeue is opt-in, and deliberately so. Getting it wrong in the requeue
-# direction costs an unbounded hot loop that starves the prefetch slots; getting
-# it wrong the other way costs one page's links, which Heritrix will crawl
-# itself anyway. Only failures that mean *our* browser died belong here.
+# Retryable is opt-in, and deliberately so. Getting it wrong in that direction
+# costs an unbounded hot loop that starves the prefetch slots; getting it wrong
+# the other way costs one page's links, which Heritrix will crawl itself anyway.
+# Only failures that mean *our* browser died belong here -- and even those are
+# only acted on when `enable_page_retries` is set.
 PLAYWRIGHT_ERRORS: tuple[tuple[str, str, bool], ...] = (
-    # fragment, metric slug, requeue
+    # fragment, metric slug, retryable
     ("download is starting", "download_started", False),
     ("is interrupted by another navigation", "navigation_interrupted", False),
     ("frame was detached", "frame_detached", False),
@@ -229,11 +230,11 @@ UNKNOWN_PLAYWRIGHT_ERROR = ("playwright_error", False)
 
 
 def classify_playwright_message(text: str) -> tuple[str, bool]:
-    """Map a Playwright error message to its `(slug, requeue)`, first match wins."""
+    """Map a Playwright error message to its `(slug, retryable)`, first match wins."""
     lowered = text.lower()
-    for fragment, slug, requeue in PLAYWRIGHT_ERRORS:
+    for fragment, slug, retryable in PLAYWRIGHT_ERRORS:
         if fragment in lowered:
-            return slug, requeue
+            return slug, retryable
     return UNKNOWN_PLAYWRIGHT_ERROR
 
 
@@ -249,7 +250,8 @@ class PageFailure(NamedTuple):
     at connect or TLS, so the one request that fired is the URL Heritrix just
     handed us.
 
-    `requeue` sends the message back for another attempt. Reserved for failures
+    `retryable` marks a failure another attempt could plausibly get past, and is
+    acted on only when `enable_page_retries` is set. Reserved for failures
     that say nothing about the URL -- our connectivity, our browser handle, our
     broker. Requeueing anything else is what turned a handful of sites with bad
     certificates into a hot loop: the failure takes milliseconds, the message
@@ -261,7 +263,7 @@ class PageFailure(NamedTuple):
     """
 
     reason: str
-    requeue: bool
+    retryable: bool
     publish: bool
 
 
@@ -271,7 +273,7 @@ def classify_page_failure(e: Exception, deadline_expired: bool) -> PageFailure:
     # full navigation timeout, but the requests it fired along the way are real
     # links, so they are kept rather than discarded.
     if isinstance(e, PlaywrightTimeoutError):
-        return PageFailure("navigation_timeout", requeue=False, publish=True)
+        return PageFailure("navigation_timeout", retryable=False, publish=True)
     if isinstance(e, PlaywrightError):
         match = NET_ERROR_PATTERN.search(str(e))
         if match:
@@ -281,8 +283,8 @@ def classify_page_failure(e: Exception, deadline_expired: bool) -> PageFailure:
         # ones are not requeued: a URL that serves a download or redirects into
         # another navigation fails identically forever, and guessing "retry"
         # here is what put the cert errors into a hot loop.
-        slug, requeue = classify_playwright_message(str(e))
-        return PageFailure(slug, requeue, publish=False)
+        slug, retryable = classify_playwright_message(str(e))
+        return PageFailure(slug, retryable, publish=False)
     # Our own page deadline. Only it actually expiring counts: the builtin
     # TimeoutError is an OSError subclass that aio-pika also raises from a
     # socket operation.
@@ -292,8 +294,8 @@ def classify_page_failure(e: Exception, deadline_expired: bool) -> PageFailure:
     # Terminal even when the page reached nothing: having already spent the
     # budget once is reason enough not to spend it again on a redelivery.
     if isinstance(e, TimeoutError) and deadline_expired:
-        return PageFailure("page_timeout", requeue=False, publish=True)
-    return PageFailure(type(e).__name__, requeue=True, publish=False)
+        return PageFailure("page_timeout", retryable=False, publish=True)
+    return PageFailure(type(e).__name__, retryable=True, publish=False)
 
 
 async def publish_outlinks(
@@ -346,7 +348,7 @@ def log_page_failure(
             "the site.",
             message.url,
         )
-    elif not failure.requeue:
+    elif not failure.retryable:
         # No traceback: these are expected, fully described by the reason, and
         # numerous enough that stack traces would bury everything else. The
         # per-reason counter is what to watch, not the log.
@@ -489,19 +491,12 @@ async def process_page(
         if await publish_outlinks(client, message, page_requests):
             update_metrics(page_requests)
 
-    # Applied here rather than in the classification, so `failure.requeue` stays
-    # a statement about the failure and this stays a statement of policy.
-    requeue = failure is not None and failure.requeue
-    if requeue and settings.disable_page_retries:
-        logger.warning(
-            "Retries are disabled: settling %s after %s instead of requeueing "
-            "it. Whatever links it had are lost.",
-            message.url,
-            failure.reason,
-        )
-        requeue = False
-
-    if requeue:
+    # Policy is applied here rather than in the classification, so
+    # `failure.retryable` stays a statement about the failure and this stays a
+    # statement about what we do with it. Off by default, so the normal path
+    # settles every message exactly once; `log_page_failure` has already
+    # reported anything retryable that is being given up on.
+    if failure is not None and failure.retryable and settings.enable_page_retries:
         await robust_nack(raw_message, message.url)
     else:
         await robust_ack(raw_message, message.url)
@@ -524,6 +519,19 @@ async def main():
     )
     ch.setFormatter(formatter)
     logger.addHandler(ch)
+
+    # Warned once at startup rather than per page: with retries on this fires on
+    # every retryable failure, and the thing worth knowing is that the instance
+    # is running in this mode at all.
+    if settings.enable_page_retries:
+        logger.warning(
+            "enable_page_retries is on. This is EXPERIMENTAL: a requeued message "
+            "is redelivered immediately, so a URL that fails the same way every "
+            "time will loop as fast as it can fail and can occupy every one of "
+            "the %d page slots while this process still looks healthy. Watch "
+            "penumbra_pages_failed and turn it back off if it climbs.",
+            settings.max_concurrency,
+        )
 
     # Setup metrics
     if settings.metrics_enabled:

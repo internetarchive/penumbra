@@ -31,6 +31,15 @@ def fresh_shutdown_event():
         yield event
 
 
+@pytest.fixture
+def page_retries_enabled(monkeypatch):
+    """
+    Retries are off by default, so the requeue paths are unreachable without
+    this. Kept as a fixture so every test that needs it says so in its signature.
+    """
+    monkeypatch.setattr(worker.settings, "enable_page_retries", True)
+
+
 def message_maker(url: str) -> MagicMock:
     message = MagicMock(spec=aio_pika.IncomingMessage)
     message.body = json.dumps(
@@ -282,8 +291,10 @@ async def test_process_page_never_nacks_a_message_it_has_acked(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_process_page_still_nacks_when_the_page_fails_before_the_ack():
-    """The ack guard must not suppress the nack a genuine page failure needs."""
+async def test_process_page_still_nacks_when_the_page_fails_before_the_ack(
+    page_retries_enabled,
+):
+    """An unrecognised failure is retryable, so with retries on it is requeued."""
     message = message_maker("https://example.com")
     message.ack = AsyncMock()
     message.nack = AsyncMock()
@@ -302,7 +313,9 @@ async def test_process_page_still_nacks_when_the_page_fails_before_the_ack():
 
 
 @pytest.mark.asyncio
-async def test_process_page_does_not_count_an_unrelated_timeout_as_a_page_timeout():
+async def test_process_page_does_not_count_an_unrelated_timeout_as_a_page_timeout(
+    page_retries_enabled,
+):
     """
     The builtin TimeoutError is an OSError subclass that aio-pika can raise from a
     socket operation. Only the page deadline actually expiring may increment
@@ -380,7 +393,9 @@ async def test_process_page_drops_permanently_unreachable_pages(message_text, re
 
 
 @pytest.mark.asyncio
-async def test_process_page_requeues_a_net_error_that_is_our_end_of_the_wire():
+async def test_process_page_requeues_a_net_error_that_is_our_end_of_the_wire(
+    page_retries_enabled,
+):
     """
     Not every `net::` error is the site's fault. Losing our own connectivity says
     nothing about the URL, so those stay retryable.
@@ -415,7 +430,9 @@ async def test_process_page_drops_a_page_that_never_finished_navigating():
 
 
 @pytest.mark.asyncio
-async def test_process_page_requeues_only_browser_side_playwright_errors():
+async def test_process_page_requeues_only_browser_side_playwright_errors(
+    page_retries_enabled,
+):
     """
     Playwright reports these only in the message text, and requeueing is opt-in:
     a dead browser is worth another attempt, anything else is not.
@@ -429,15 +446,13 @@ async def test_process_page_requeues_only_browser_side_playwright_errors():
 
 
 @pytest.mark.asyncio
-async def test_disable_page_retries_settles_what_would_have_been_requeued(
-    monkeypatch, caplog
-):
+async def test_nothing_is_requeued_by_default(caplog):
     """
-    The kill switch turns the last requeueing path off, so every message is
-    settled exactly once whatever went wrong. The page is still counted under its
-    own reason, and the suppressed retry is logged rather than silent.
+    Retries are off unless asked for, so out of the box every message is settled
+    exactly once -- even the failures a retry could plausibly get past. The page
+    is still counted under its own reason and reported, not silently dropped.
     """
-    monkeypatch.setattr(worker.settings, "disable_page_retries", True)
+    assert worker.settings.enable_page_retries is False
 
     closed_pre = failed_pages_total("target_closed")
 
@@ -448,20 +463,20 @@ async def test_disable_page_retries_settles_what_would_have_been_requeued(
 
     message.ack.assert_awaited_once()
     message.nack.assert_not_awaited()
-    assert "Retries are disabled" in caplog.text
+    assert "Exception while processing page" in caplog.text
     # Still visible as the browser-side failure it is, not relabelled.
     assert failed_pages_total("target_closed") == closed_pre + 1
 
 
-@pytest.mark.asyncio
-async def test_page_retries_are_enabled_by_default():
-    """The switch is off unless asked for, so the library default is unchanged."""
-    assert worker.settings.disable_page_retries is False
-
-    message = await run_failing_page(PlaywrightError("Target crashed"))
-
-    message.nack.assert_awaited_once_with(requeue=True)
-    message.ack.assert_not_awaited()
+def test_retryable_failures_stay_classified_when_retries_are_off():
+    """
+    The switch is policy, not classification: `retryable` keeps saying what the
+    failure is, so turning retries on later needs no reclassification and the
+    metric reason is the same either way.
+    """
+    assert worker.classify_page_failure(PlaywrightError("Target crashed"), False) == (
+        worker.PageFailure("target_crashed", retryable=True, publish=False)
+    )
 
 
 @pytest.mark.asyncio
@@ -557,18 +572,18 @@ def test_classify_page_failure_separates_the_two_timeout_classes():
         PlaywrightTimeoutError("Page.goto: Timeout 30000ms exceeded."), False
     )
     assert navigation == worker.PageFailure(
-        "navigation_timeout", requeue=False, publish=True
+        "navigation_timeout", retryable=False, publish=True
     )
 
     # Both timeouts keep their links and neither goes back on the queue: having
     # spent the budget once is reason enough not to spend it again.
     page = worker.classify_page_failure(TimeoutError("deadline"), True)
-    assert page == worker.PageFailure("page_timeout", requeue=False, publish=True)
+    assert page == worker.PageFailure("page_timeout", retryable=False, publish=True)
 
     # An unrelated socket timeout, with our deadline still unexpired. Nothing
     # here says anything about the page, so it is retried and nothing published.
     assert worker.classify_page_failure(TimeoutError("socket"), False) == (
-        worker.PageFailure("TimeoutError", requeue=True, publish=False)
+        worker.PageFailure("TimeoutError", retryable=True, publish=False)
     )
 
 

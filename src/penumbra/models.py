@@ -20,15 +20,23 @@ class Settings(BaseSettings):
     # Heritrix rejects URLs longer than its UURI limit (2083 chars), so drop
     # over-length URLs before enqueueing rather than publishing dead links.
     max_url_length: int = Field(default=2083, ge=1)
-    # Kill switch for redelivery. With this set, nothing is ever requeued: every
-    # message is settled exactly once, whatever went wrong. The failures that
-    # would otherwise be retried are the browser-side ones -- a dead target, a
-    # closed connection -- and retrying those costs a slot per lap with no
-    # guarantee the next browser is healthier. Left off by default because
-    # dropping them loses that page's links outright; turn it on where an
-    # unbounded redelivery loop is the worse outcome. Suppressed retries are
-    # logged, and still counted under their own `penumbra_pages_failed` reason.
-    disable_page_retries: bool = Field(default=False)
+    # Put a failed message back on the queue for another attempt.
+    #
+    # EXPERIMENTAL, and off by default: this is the setting most likely to take
+    # an instance down. A requeued message goes back to the head of the queue and
+    # is redelivered immediately, so a URL that fails the same way every time
+    # loops as fast as it can fail. With only
+    # `browser_pool_size * contexts_per_browser` slots, a handful of those
+    # occupy every one of them while the real backlog waits, and the process
+    # stays up and healthy-looking throughout. Every redelivery loop seen in
+    # production so far has started this way.
+    #
+    # Off, a retryable failure loses that page's links outright. That is the
+    # cheaper mistake: Heritrix fetches the URL itself regardless of what
+    # penumbra reports, so what is lost is the links from one page rather than
+    # an instance's throughput. Turn it on only while watching
+    # `penumbra_pages_failed`.
+    enable_page_retries: bool = Field(default=False)
     # Nothing in `process_page` except `page.goto()` carries a deadline of its
     # own: Playwright's protocol calls and aio-pika's publish/ack all block
     # indefinitely. A single wedged browser or blocked broker connection would
