@@ -201,13 +201,48 @@ TRANSIENT_NET_ERRORS = frozenset(
     }
 )
 
+# Playwright failures that carry no `net::` code, matched as lowercase fragments
+# of the message because that is the only place Playwright reports them:
+# `type(e).__name__` is the bare string "Error" for all of them, which made every
+# one of these collapse into a single useless metric series.
+#
+# The slug keeps `penumbra_pages_failed` bounded and readable. It cannot be the
+# raw message -- some of these embed URLs ("Navigation to X is interrupted by
+# another navigation to Y"), which would give the label unbounded cardinality.
+#
+# Requeue is opt-in, and deliberately so. Getting it wrong in the requeue
+# direction costs an unbounded hot loop that starves the prefetch slots; getting
+# it wrong the other way costs one page's links, which Heritrix will crawl
+# itself anyway. Only failures that mean *our* browser died belong here.
+PLAYWRIGHT_ERRORS: tuple[tuple[str, str, bool], ...] = (
+    # fragment, metric slug, requeue
+    ("download is starting", "download_started", False),
+    ("is interrupted by another navigation", "navigation_interrupted", False),
+    ("frame was detached", "frame_detached", False),
+    # Covers "Target page, context or browser has been closed" too.
+    ("browser has been closed", "target_closed", True),
+    ("target crashed", "target_crashed", True),
+    ("connection closed", "connection_closed", True),
+    ("protocol error", "protocol_error", True),
+)
+UNKNOWN_PLAYWRIGHT_ERROR = ("playwright_error", False)
+
+
+def classify_playwright_message(text: str) -> tuple[str, bool]:
+    """Map a Playwright error message to its `(slug, requeue)`, first match wins."""
+    lowered = text.lower()
+    for fragment, slug, requeue in PLAYWRIGHT_ERRORS:
+        if fragment in lowered:
+            return slug, requeue
+    return UNKNOWN_PLAYWRIGHT_ERROR
+
 
 class PageFailure(NamedTuple):
     """
     What a page that did not load cleanly is worth.
 
     `reason` doubles as the metric label, so it stays a bounded set: a net error
-    code, a fixed string, or an exception class name.
+    code, a Playwright slug from `PLAYWRIGHT_ERRORS`, or an exception class name.
 
     `publish` means the requests the page made before it stopped are real links,
     worth returning to Heritrix. Only timeouts qualify: everything else failed
@@ -242,9 +277,12 @@ def classify_page_failure(e: Exception, deadline_expired: bool) -> PageFailure:
         if match:
             code = match.group(1)
             return PageFailure(code, code in TRANSIENT_NET_ERRORS, publish=False)
-        # A Playwright error with no net:: code is about the browser, not the
-        # page -- a closed context or a dead target. Ours to retry.
-        return PageFailure(type(e).__name__, requeue=True, publish=False)
+        # Everything else Playwright reports only in the message text. Unknown
+        # ones are not requeued: a URL that serves a download or redirects into
+        # another navigation fails identically forever, and guessing "retry"
+        # here is what put the cert errors into a hot loop.
+        slug, requeue = classify_playwright_message(str(e))
+        return PageFailure(slug, requeue, publish=False)
     # Our own page deadline. Only it actually expiring counts: the builtin
     # TimeoutError is an OSError subclass that aio-pika also raises from a
     # socket operation.
@@ -416,7 +454,13 @@ async def process_page(
     deadline = asyncio.timeout(settings.page_timeout_seconds)
     try:
         async with deadline:
-            context = await browser.new_context()
+            # A URL that serves a download still fails the navigation either
+            # way ("Download is starting"), but accepting it writes roughly
+            # twice the file size into the browser's temp dir until the context
+            # closes -- and TMPDIR is /dev/shm in production, so that is RAM,
+            # times `browser_pool_size` concurrent pages. We cannot extract
+            # links from the bytes anyway.
+            context = await browser.new_context(accept_downloads=False)
             page = await context.new_page()
             await page.route("**/*", handle_route)
             page.on("request", lambda request: page_requests.add(request.url))
@@ -445,7 +489,19 @@ async def process_page(
         if await publish_outlinks(client, message, page_requests):
             update_metrics(page_requests)
 
-    if failure is not None and failure.requeue:
+    # Applied here rather than in the classification, so `failure.requeue` stays
+    # a statement about the failure and this stays a statement of policy.
+    requeue = failure is not None and failure.requeue
+    if requeue and settings.disable_page_retries:
+        logger.warning(
+            "Retries are disabled: settling %s after %s instead of requeueing "
+            "it. Whatever links it had are lost.",
+            message.url,
+            failure.reason,
+        )
+        requeue = False
+
+    if requeue:
         await robust_nack(raw_message, message.url)
     else:
         await robust_ack(raw_message, message.url)

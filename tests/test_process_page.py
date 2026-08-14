@@ -415,17 +415,134 @@ async def test_process_page_drops_a_page_that_never_finished_navigating():
 
 
 @pytest.mark.asyncio
-async def test_process_page_requeues_a_browser_side_playwright_error():
+async def test_process_page_requeues_only_browser_side_playwright_errors():
     """
-    A Playwright error carrying no `net::` code is about our browser rather than
-    the page -- a closed context or a dead target -- and is ours to retry.
+    Playwright reports these only in the message text, and requeueing is opt-in:
+    a dead browser is worth another attempt, anything else is not.
     """
     message = await run_failing_page(
         PlaywrightError("Target page, context or browser has been closed")
     )
+    message.nack.assert_awaited_once_with(requeue=True)
+    message.ack.assert_not_awaited()
+    assert failed_pages_total("target_closed") > 0
+
+
+@pytest.mark.asyncio
+async def test_disable_page_retries_settles_what_would_have_been_requeued(
+    monkeypatch, caplog
+):
+    """
+    The kill switch turns the last requeueing path off, so every message is
+    settled exactly once whatever went wrong. The page is still counted under its
+    own reason, and the suppressed retry is logged rather than silent.
+    """
+    monkeypatch.setattr(worker.settings, "disable_page_retries", True)
+
+    closed_pre = failed_pages_total("target_closed")
+
+    with caplog.at_level(logging.WARNING, logger="penumbra.worker"):
+        message = await run_failing_page(
+            PlaywrightError("Target page, context or browser has been closed")
+        )
+
+    message.ack.assert_awaited_once()
+    message.nack.assert_not_awaited()
+    assert "Retries are disabled" in caplog.text
+    # Still visible as the browser-side failure it is, not relabelled.
+    assert failed_pages_total("target_closed") == closed_pre + 1
+
+
+@pytest.mark.asyncio
+async def test_page_retries_are_enabled_by_default():
+    """The switch is off unless asked for, so the library default is unchanged."""
+    assert worker.settings.disable_page_retries is False
+
+    message = await run_failing_page(PlaywrightError("Target crashed"))
 
     message.nack.assert_awaited_once_with(requeue=True)
     message.ack.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_process_page_drops_a_url_that_serves_a_download():
+    """
+    `Page.goto: Download is starting` carries no `net::` code, so the old
+    catch-all called it a browser problem and requeued it -- a hot loop, because
+    a URL with Content-Disposition: attachment does this on every redelivery.
+    There is nothing to extract from the bytes either way.
+    """
+    dropped_pre = failed_pages_total("download_started")
+
+    message = await run_failing_page(PlaywrightError("Page.goto: Download is starting"))
+
+    message.ack.assert_awaited_once()
+    message.nack.assert_not_awaited()
+    assert failed_pages_total("download_started") == dropped_pre + 1
+
+
+@pytest.mark.asyncio
+async def test_process_page_does_not_requeue_an_unrecognised_playwright_error():
+    """
+    Unknown is not retryable. Guessing "retry" is what put the cert errors into a
+    hot loop, and the costs are lopsided: a wrong ack loses one page's links,
+    which Heritrix crawls itself anyway, while a wrong requeue starves the queue.
+    """
+    dropped_pre = failed_pages_total("playwright_error")
+
+    message = await run_failing_page(PlaywrightError("Page.goto: something novel"))
+
+    message.ack.assert_awaited_once()
+    message.nack.assert_not_awaited()
+    assert failed_pages_total("playwright_error") == dropped_pre + 1
+
+
+def test_playwright_error_slugs_stay_bounded():
+    """
+    The slug is a metric label. Playwright messages embed URLs, so mapping them
+    through a table is what keeps the label's cardinality finite.
+    """
+    noisy = (
+        'Page.goto: Navigation to "https://example.com/a?x=1" is interrupted by '
+        'another navigation to "https://example.com/b?y=2"'
+    )
+    assert worker.classify_playwright_message(noisy) == (
+        "navigation_interrupted",
+        False,
+    )
+    assert worker.classify_playwright_message("Page.goto: Download is starting") == (
+        "download_started",
+        False,
+    )
+    # Case-insensitive, and the "Target page, context or browser has been
+    # closed" wording is covered by the same fragment.
+    assert worker.classify_playwright_message("TARGET CRASHED") == (
+        "target_crashed",
+        True,
+    )
+    assert worker.classify_playwright_message("anything else") == (
+        "playwright_error",
+        False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_page_refuses_downloads():
+    """
+    Accepting a download writes roughly twice the file size into the browser's
+    temp dir until the context closes. TMPDIR is /dev/shm in production, so that
+    is RAM, times `browser_pool_size` concurrent pages -- for bytes we cannot
+    extract links from.
+    """
+    message = message_maker("https://example.com")
+    message.ack = AsyncMock()
+    browser = page_browser_mock()
+
+    client = MagicMock(spec=AsyncMessageClient)
+    client.publish_message = AsyncMock()
+    await process_page(client, browser, message)
+
+    assert browser.new_context.await_args.kwargs["accept_downloads"] is False
 
 
 def test_classify_page_failure_separates_the_two_timeout_classes():
