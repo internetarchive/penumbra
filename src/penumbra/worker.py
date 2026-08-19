@@ -28,12 +28,8 @@ shutdown_event = asyncio.Event()
 settings = Settings()
 
 
-# Monotonic timestamp of the last completed page, so a clock step cannot invent
-# or hide a stall. Seeded at startup rather than left unset until the first page
-# completes: an instance that fills every slot and wedges before finishing a
-# single page is the stall most worth hearing about, and there would be nothing
-# to measure it from.
-last_completion: float = monotonic()
+class InstanceStalled(Exception):
+    """This instance stopped making progress and will not recover without a restart."""
 
 
 class SilentBoundedSemaphore(asyncio.BoundedSemaphore):
@@ -168,48 +164,112 @@ def update_metrics(urls: set[str]) -> None:
     time, not a non-event. `penumbra_pages_failed` is where the breakdown lives;
     counting only the pages that loaded would make this a measure of the web's
     health rather than of penumbra's throughput.
-
-    `last_completion` follows the same rule, and that is what makes
-    `warn_if_stalled` mean something: it fires only when page tasks stop
-    finishing altogether, rather than whenever a run of URLs happens to be bad.
     """
-    global last_completion
     metrics.penumbra_last_page_crawled_time.set_to_current_time()
     metrics.penumbra_pages_crawled.inc(1)
     metrics.penumbra_urls_found.inc(len(urls))
-    last_completion = monotonic()
 
 
-async def warn_if_stalled(tasks: set[asyncio.Task], max_concurrency: int) -> None:
+def stalled_page_slots(page_tasks: dict[asyncio.Task, float]) -> list[float]:
     """
-    Periodically warn when page tasks are in flight but none are completing.
+    Ages of the page tasks that have outlived their own backstop, oldest first.
 
-    A separate task rather than a check in the main loop on purpose: a stalled
-    instance is parked on `semaphore.acquire()` and never iterates the loop
-    again, so a check there would never run in the case it exists to catch.
+    A page task cannot legitimately be this old: `run_page_task` wraps it in
+    `task_timeout_seconds`, so reaching `page_task_stall_seconds` means the
+    `wait_for` did not fire and the permit is leaked for the life of the process.
     """
+    now = monotonic()
+    return sorted(
+        (
+            now - started
+            for started in page_tasks.values()
+            if now - started > settings.page_task_stall_seconds
+        ),
+        reverse=True,
+    )
+
+
+async def watch_for_stalls(
+    client: AsyncMessageClient, page_tasks: dict[asyncio.Task, float]
+) -> str | None:
+    """
+    Give up and exit when this instance stops making progress.
+
+    Returns why it gave up, or None if it was stopped by an ordinary shutdown.
+
+    Two ways that happens:
+
+    *The broker goes away and never comes back.*
+    *A page task outlives its backstop.*
+
+    Deliberately slow to fire on the broker. A restart or a brief partition
+    resolves well inside `broker_unhealthy_exit_seconds`.
+    The page-slot check needs no grace period: `page_task_stall_seconds` is
+    already derived from the backstop that should have fired long before.
+    """
+    unhealthy_since: float | None = None
     while True:
+        # Wake on the interval, or return early if we are shutting down for some
+        # other reason -- an operator's SIGTERM must not wait out the interval.
         try:
-            async with asyncio.timeout(settings.stall_check_interval_seconds):
+            async with asyncio.timeout(settings.watchdog_interval_seconds):
                 await shutdown_event.wait()
-            return
+            return None
         except TimeoutError:
             pass
 
-        # No tasks in flight means an idle cluster, which is not a stall.
-        if not tasks:
+        stalled = stalled_page_slots(page_tasks)
+        if stalled:
+            logger.error(
+                "%d of %d page slot(s) have been running longer than the %.0fs "
+                "backstop that should have freed them (oldest %.0fs). Their "
+                "permits are leaked, so this instance is down to %d usable slots "
+                "and will reach zero. Exiting so the supervisor restarts us.",
+                len(stalled),
+                settings.max_concurrency,
+                settings.page_task_stall_seconds,
+                stalled[0],
+                settings.max_concurrency - len(stalled),
+            )
+            shutdown_event.set()
+            return (
+                f"{len(stalled)} page slot(s) stuck beyond "
+                f"{settings.page_task_stall_seconds:.0f}s, permits leaked"
+            )
+
+        if client.is_usable():
+            if unhealthy_since is not None:
+                logger.info(
+                    "AMQP topology for queue %s is usable again after %.0fs.",
+                    settings.amqp_queue_name,
+                    monotonic() - unhealthy_since,
+                )
+                unhealthy_since = None
             continue
 
-        idle_for = monotonic() - last_completion
-        if idle_for > settings.stall_warning_seconds:
+        if unhealthy_since is None:
+            unhealthy_since = monotonic()
             logger.warning(
-                "%d/%d page slots in use but no page has completed in %.0fs. "
-                "This instance may have stalled and stopped consuming from %s; "
-                "a restart will clear it.",
-                len(tasks),
-                max_concurrency,
-                idle_for,
+                "AMQP topology for queue %s is not usable. Allowing %.0fs for it "
+                "to recover before restarting.",
                 settings.amqp_queue_name,
+                settings.broker_unhealthy_exit_seconds,
+            )
+            continue
+
+        unhealthy_for = monotonic() - unhealthy_since
+        if unhealthy_for >= settings.broker_unhealthy_exit_seconds:
+            logger.error(
+                "AMQP topology for queue %s has been unusable for %.0fs and is not "
+                "recovering on its own. Exiting so the supervisor restarts us: "
+                "staying up would mean consuming nothing while looking healthy.",
+                settings.amqp_queue_name,
+                unhealthy_for,
+            )
+            shutdown_event.set()
+            return (
+                f"AMQP topology for queue {settings.amqp_queue_name} unusable for "
+                f"{unhealthy_for:.0f}s"
             )
 
 
@@ -574,6 +634,59 @@ async def process_page(
     update_metrics(outlinks)
 
 
+# Returned by `or_shutdown` when the shutdown signal won the race. A sentinel
+# rather than None, because `semaphore.acquire()` legitimately returns None.
+SHUTDOWN = object()
+
+
+def _swallow(task: asyncio.Future) -> None:
+    """Read a finished task's outcome, so asyncio does not report it unretrieved."""
+    if not task.cancelled():
+        task.exception()
+
+
+def _abandon(task: asyncio.Future) -> None:
+    """
+    Let go of a task whose outcome no longer matters, quietly.
+
+    Cancelled if it is still running, read if it already finished. An unread
+    exception on a discarded task resurfaces later as "Task exception was never
+    retrieved", which reads like a fault and is not one.
+    """
+    if task.done():
+        _swallow(task)
+        return
+    task.cancel()
+    task.add_done_callback(_swallow)
+
+
+async def or_shutdown(awaitable):
+    """
+    Await `awaitable`, or return `SHUTDOWN` if a shutdown signal arrives first.
+
+    Allows us to respond to a shutdown signal while waiting for something that may be stalled
+    """
+    task = asyncio.ensure_future(awaitable)
+    waiter = asyncio.ensure_future(shutdown_event.wait())
+    try:
+        await asyncio.wait((task, waiter), return_when=asyncio.FIRST_COMPLETED)
+        # The event is asked directly rather than `waiter.done()`, which is also
+        # true when the wait itself failed -- and would then report a shutdown
+        # nobody requested. Shutdown wins a tie: a delivery that landed in the
+        # same moment is left unacked for redelivery, rather than started with no
+        # time left to finish it.
+        if shutdown_event.is_set():
+            return SHUTDOWN
+        if task.done():
+            return task.result()
+        # Only reachable if the waiter finished without the event being set. Wait
+        # out the real work rather than inventing a shutdown.
+        return await task
+    finally:
+        _abandon(waiter)
+        _abandon(task)
+
+
 def ensure_playwright_installed():
     """Installs playwright's browser and all dependencies (if needed) at runtime."""
     import subprocess
@@ -582,15 +695,12 @@ def ensure_playwright_installed():
 
 
 async def main():
-    # Setup logging
-    logger.setLevel(logging.DEBUG)
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG)
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
+    logger.setLevel(logging.DEBUG)
+    logging.getLogger("aiormq").setLevel(logging.WARNING)
 
     if settings.enable_page_retries:
         logger.warning(
@@ -618,6 +728,7 @@ async def main():
         prefetch_count=max_concurrency,
         publish_timeout=settings.publish_timeout_seconds,
         connect_timeout=settings.amqp_connect_timeout_seconds,
+        recovery_timeout=settings.amqp_recovery_timeout_seconds,
     )
 
     # Setup Playwright
@@ -635,7 +746,10 @@ async def main():
     # Setup semaphore for concurrent browser tasks.
     semaphore = SilentBoundedSemaphore(max_concurrency)
 
-    tasks = set()
+    # Task -> the monotonic time it started, so the watchdog can age each slot
+    # individually. A single instance-wide "last completion" timestamp could only
+    # ever catch a total stall, because one healthy slot kept refreshing it.
+    page_tasks: dict[asyncio.Task, float] = {}
 
     async def run_page_task(browser: Browser, raw_message: aio_pika.IncomingMessage):
         """
@@ -668,46 +782,90 @@ async def main():
 
     def done_callback(task: asyncio.Task):
         """`done_callback` is called when page tasks complete."""
-        tasks.discard(task)
+        page_tasks.pop(task, None)
 
-    # Function to handle shutdown signals
     def shutdown_signal_handler():
         logger.info("Shutdown signal received. Shutting down gracefully...")
 
         shutdown_event.set()
 
-    # Register the signal handlers
-    signal.signal(signal.SIGTERM, lambda s, f: shutdown_signal_handler())
-    signal.signal(signal.SIGINT, lambda s, f: shutdown_signal_handler())
+    # `add_signal_handler`, not `signal.signal`: a plain handler sets the event
+    # without waking the selector, leaving an idle loop parked until its next
+    # timer fires.
+    loop = asyncio.get_running_loop()
+    for signal_number in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(signal_number, shutdown_signal_handler)
 
-    stall_warning_task = asyncio.create_task(warn_if_stalled(tasks, max_concurrency))
+    watchdog_task = asyncio.create_task(watch_for_stalls(client, page_tasks))
 
     # Main worker loop
     try:
         async with client.iterator() as messages:
-            async for raw_message in messages:
-                if shutdown_event.is_set():
+            while True:
+                # Wait for free slot, or shutdown
+                if await or_shutdown(semaphore.acquire()) is SHUTDOWN:
+                    logger.info("Shutdown requested; stopping consumption.")
                     break
-                await semaphore.acquire()
+
+                try:
+                    raw_message = await or_shutdown(
+                        anext(messages)
+                    )  # message, OR shutdown
+                except StopAsyncIteration:
+                    semaphore.release()
+                    logger.info("Queue iterator closed; stopping consumption.")
+                    break
+
+                if raw_message is SHUTDOWN:
+                    semaphore.release()
+                    logger.info("Shutdown requested; stopping consumption.")
+                    break
+
                 browser = next(browser_pool)
                 logger.info("Got message from queue")
                 task = asyncio.create_task(
                     run_page_task(browser["browser"], raw_message)
                 )
                 task.add_done_callback(done_callback)
-                tasks.add(task)
+                page_tasks[task] = monotonic()
 
-        # Wait for in-progress tasks to complete before shutdown
-        logger.info("Waiting for in-progress tasks to complete...")
-        await asyncio.gather(*tasks)
+        # Wait for in-progress tasks before shutdown, but only for so long. A page
+        # task's own backstop is `task_timeout_seconds`, which is longer than
+        # systemd's default TimeoutStopSec -- so draining without a bound would
+        # just move the SIGKILL from the idle case to the busy one. Anything
+        # abandoned here was never acked, so the broker redelivers it.
+        draining = set(page_tasks)
+        if draining:
+            logger.info(
+                "Waiting up to %ss for %d in-progress page task(s) to complete...",
+                settings.shutdown_drain_timeout_seconds,
+                len(draining),
+            )
+            _, pending = await asyncio.wait(
+                draining, timeout=settings.shutdown_drain_timeout_seconds
+            )
+            if pending:
+                logger.warning(
+                    "Abandoning %d page task(s) still running after %ss; their "
+                    "messages were never acked and will be redelivered.",
+                    len(pending),
+                    settings.shutdown_drain_timeout_seconds,
+                )
+                for task in pending:
+                    _abandon(task)
+
+        # Raised here rather than from the watchdog itself, so the in-flight pages
+        # still get their chance to finish and ack first. Non-zero exit is the
+        # point: `Restart=always` brings us back, and the unit shows a failure
+        # instead of a process that is up and quietly consuming nothing.
+        if watchdog_task.done() and not watchdog_task.cancelled():
+            if reason := watchdog_task.result():
+                raise InstanceStalled(reason)
 
     except asyncio.CancelledError:
         pass
     # Startup could not reach a usable broker. Exit non-zero and let the
-    # supervisor retry with backoff: a crash-looping unit is visible and
-    # alertable, whereas staying up without consuming is not -- /metrics is
-    # already served by this point, and `warn_if_stalled` stays quiet because no
-    # page task ever started.
+    # supervisor retry with backoff
     except (TimeoutError, aio_pika.exceptions.AMQPError) as e:
         logger.error(
             "Could not establish a usable AMQP connection for queue %s within %ss. "
@@ -718,11 +876,11 @@ async def main():
         )
         raise
     finally:
-        stall_warning_task.cancel()
+        watchdog_task.cancel()
         # Awaited, not just cancelled, so the loop is not torn down with it still
         # pending -- which asyncio reports as a "Task was destroyed" error.
         with suppress(asyncio.CancelledError):
-            await stall_warning_task
+            await watchdog_task
 
         for _ in range(settings.browser_pool_size):
             browser = next(browser_pool)

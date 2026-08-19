@@ -17,6 +17,27 @@ class Settings(BaseSettings):
     amqp_routing_key: str = Field(default="urls")
     amqp_exchange_name: str = Field(default="umbra")
     amqp_connect_timeout_seconds: float = Field(default=60.0, gt=0)
+    # How long to let aio-pika restore a channel the broker closed before giving
+    # up on it and rebuilding the connection. A robust channel normally reopens
+    # itself, so this is a grace period rather than a limit -- but the recovery is
+    # not guaranteed, and without an end to the waiting a dead channel under a
+    # live connection stops the instance consuming for the life of the process.
+    # Kept below `publish_timeout_seconds`, which encloses it on the publish path.
+    amqp_recovery_timeout_seconds: float = Field(default=10.0, gt=0)
+    # Grace period for in-progress page tasks at shutdown. Deliberately well under
+    # systemd's default TimeoutStopSec (90s): a page task's own backstop is
+    # `task_timeout_seconds`, so an unbounded drain would earn a SIGKILL whenever
+    # pages are in flight. Abandoned tasks were never acked, so their messages are
+    # redelivered.
+    shutdown_drain_timeout_seconds: float = Field(default=30.0, gt=0)
+    # How often the watchdog checks that this instance is still making progress.
+    watchdog_interval_seconds: float = Field(default=30.0, gt=0)
+    # How long the AMQP topology may stay unusable before the process gives up and
+    # exits for the supervisor to restart it. Comfortably longer than
+    # `amqp_recovery_timeout_seconds` and than a broker restart, so an outage that
+    # resolves itself never costs a restart -- but far short of the ten hours the
+    # August outages spent sitting idle. See `watch_broker`.
+    broker_unhealthy_exit_seconds: float = Field(default=300.0, gt=0)
     # Heritrix rejects URLs longer than its UURI limit (2083 chars), so drop
     # over-length URLs before enqueueing rather than publishing dead links.
     max_url_length: int = Field(default=2083, ge=1)
@@ -54,11 +75,6 @@ class Settings(BaseSettings):
     publish_timeout_seconds: float = Field(default=30.0, gt=0)
     publish_max_attempts: int = Field(default=3, ge=1)
     publish_retry_base_delay_seconds: float = Field(default=0.5, gt=0)
-    # Warn when pages are in flight but none are completing. A stalled instance
-    # keeps running, so systemd sees a healthy unit and nothing else in the log
-    # says anything is wrong.
-    stall_warning_seconds: float = Field(default=3600.0, gt=0)
-    stall_check_interval_seconds: float = Field(default=300.0, gt=0)
     install_playwright: bool = Field(default=True)
     skip_resource_document: bool = Field(default=False)
     skip_resource_stylesheet: bool = Field(default=False)
@@ -114,6 +130,24 @@ class Settings(BaseSettings):
             + self.amqp_ack_timeout_seconds
             + 30.0
         )
+
+    @computed_field
+    @cached_property
+    def page_task_stall_seconds(self) -> float:
+        """
+        How long a single page task may run before the watchdog calls it stuck.
+
+        Derived rather than configured, so it cannot be set below the backstop it
+        is checking. `run_page_task` wraps every page in `task_timeout_seconds`,
+        so no task should ever reach this: getting here means the `wait_for`
+        itself failed to fire -- a cancellation the page never honoured -- and the
+        semaphore permit it holds is gone for the life of the process.
+
+        The margin is generous because the cost of a false positive is a restart
+        of a working instance, while the cost of a slow true positive is one slot
+        out of `max_concurrency` for a few more minutes.
+        """
+        return self.task_timeout_seconds + 300.0
 
     @computed_field
     @cached_property

@@ -616,21 +616,19 @@ async def test_a_dead_end_page_still_counts_as_crawled():
 
 
 @pytest.mark.asyncio
-async def test_every_finished_page_task_counts_and_refreshes_the_stall_clock(
-    monkeypatch,
-):
+async def test_every_finished_page_task_counts_as_a_crawl(monkeypatch):
     """
-    `warn_if_stalled` reads `last_completion`, so what refreshes it decides which
-    instances look stalled. A failed page is still a finished task, so it counts:
-    the warning is for an instance that has stopped getting through work at all,
-    not one working through a bad run of URLs.
+    A failed page is still a finished task, so it counts. `penumbra_pages_crawled`
+    measures penumbra's throughput, not the web's health -- counting only the
+    pages that loaded would make a bad run of URLs look like an outage, and
+    `penumbra_pages_failed` already carries the breakdown.
     """
     client = MagicMock(spec=AsyncMessageClient)
     client.publish_message = AsyncMock()
 
     # A URL we could not reach.
-    monkeypatch.setattr(worker, "last_completion", 1.0)
     crawled_pre = REGISTRY.get_sample_value("penumbra_pages_crawled_total") or 0
+    last_pre = REGISTRY.get_sample_value("penumbra_last_page_crawled_time") or 0
     browser = page_browser_mock()
     browser.new_context.return_value.new_page.return_value.goto = AsyncMock(
         side_effect=PlaywrightTimeoutError("Page.goto: Timeout")
@@ -638,14 +636,11 @@ async def test_every_finished_page_task_counts_and_refreshes_the_stall_clock(
     unreachable = message_maker("https://example.com")
     unreachable.ack = AsyncMock()
     await process_page(client, browser, unreachable)
-    assert worker.last_completion != 1.0
+    assert REGISTRY.get_sample_value("penumbra_last_page_crawled_time") > last_pre
 
     # A browser that hung before the crawl phases could run. Still a finished
-    # task -- the deadline fired, the slot came back -- so it counts too. A
-    # genuine stall is tasks that never finish, which is what leaves the clock
-    # untouched.
+    # task -- the deadline fired, the slot came back -- so it counts too.
     monkeypatch.setitem(worker.settings.__dict__, "browser_deadline_seconds", 0.1)
-    monkeypatch.setattr(worker, "last_completion", 1.0)
 
     async def hang(*args, **kwargs):
         await asyncio.sleep(60)
@@ -655,7 +650,6 @@ async def test_every_finished_page_task_counts_and_refreshes_the_stall_clock(
     stuck = message_maker("https://example.com")
     stuck.ack = AsyncMock()
     await asyncio.wait_for(process_page(client, stuck_browser, stuck), timeout=5)
-    assert worker.last_completion != 1.0
 
     assert REGISTRY.get_sample_value("penumbra_pages_crawled_total") == crawled_pre + 2
 
@@ -977,83 +971,44 @@ async def test_robust_context_close_bounds_a_hanging_close(monkeypatch):
     await asyncio.wait_for(worker.robust_context_close(context), timeout=5)
 
 
-@pytest.mark.asyncio
-async def test_warn_if_stalled_warns_when_nothing_completes(
-    monkeypatch, caplog, fresh_shutdown_event
-):
-    """Slots in use with no completion inside the window logs one warning."""
-    monkeypatch.setattr(worker.settings, "stall_check_interval_seconds", 0.05)
-    monkeypatch.setattr(worker.settings, "stall_warning_seconds", 0.0)
-    monkeypatch.setattr(worker, "last_completion", monotonic())
+def test_stalled_page_slots_ignores_tasks_inside_their_backstop(monkeypatch):
+    """A page that is merely slow is not stuck; its own `wait_for` still owns it."""
+    monkeypatch.setitem(worker.settings.__dict__, "page_task_stall_seconds", 100.0)
+    now = monotonic()
 
-    tasks = {MagicMock()}
-
-    with caplog.at_level(logging.WARNING, logger="penumbra.worker"):
-        task = asyncio.create_task(worker.warn_if_stalled(tasks, 10))
-        await asyncio.sleep(0.12)
-        task.cancel()
-
-    assert "1/10 page slots in use" in caplog.text
-    assert "stopped consuming" in caplog.text
+    assert worker.stalled_page_slots({}) == []
+    assert worker.stalled_page_slots({MagicMock(): now}) == []
+    assert worker.stalled_page_slots({MagicMock(): now - 99}) == []
 
 
-@pytest.mark.asyncio
-async def test_warn_if_stalled_warns_before_any_page_has_completed(
-    monkeypatch, caplog, fresh_shutdown_event
-):
+def test_stalled_page_slots_reports_each_stuck_slot_oldest_first(monkeypatch):
     """
-    An instance that fills every slot and wedges before finishing a single page is
-    the stall most worth hearing about. `last_completion` is therefore seeded at
-    startup rather than left None until the first completion: while it was None,
-    `warn_if_stalled` skipped its check and never warned at all.
+    Every slot is aged independently, and this is the regression that matters: the
+    previous check compared one instance-wide "last completion" against now, so a
+    single healthy slot refreshed it and hid every stuck one behind it. Nine leaked
+    permits and one working page looked perfectly healthy.
     """
-    monkeypatch.setattr(worker.settings, "stall_check_interval_seconds", 0.05)
-    monkeypatch.setattr(worker.settings, "stall_warning_seconds", 0.0)
-    # The invariant the warning rests on: there is always a time to measure from.
-    assert worker.last_completion is not None
+    monkeypatch.setitem(worker.settings.__dict__, "page_task_stall_seconds", 100.0)
+    now = monotonic()
 
-    with caplog.at_level(logging.WARNING, logger="penumbra.worker"):
-        task = asyncio.create_task(worker.warn_if_stalled({MagicMock()}, 1))
-        await asyncio.sleep(0.12)
-        task.cancel()
+    stalled = worker.stalled_page_slots(
+        {
+            MagicMock(): now - 500,  # stuck, oldest
+            MagicMock(): now - 200,  # stuck
+            MagicMock(): now,  # healthy, and must not mask the others
+        }
+    )
 
-    assert "1/1 page slots in use" in caplog.text
+    assert len(stalled) == 2
+    assert stalled[0] > stalled[1]
+    assert 499 < stalled[0] < 501
 
 
-@pytest.mark.asyncio
-async def test_warn_if_stalled_silent_when_idle_or_healthy(
-    monkeypatch, caplog, fresh_shutdown_event
-):
+def test_page_task_stall_threshold_sits_above_the_backstop_it_checks():
     """
-    An idle cluster is not a stall, and neither is recent progress. Both must stay
-    quiet or the warning becomes noise nobody reads.
+    Derived rather than configured, so it cannot be set below the deadline that
+    should already have freed the slot -- which would make every slow page a false
+    positive and restart a working instance.
     """
-    monkeypatch.setattr(worker.settings, "stall_check_interval_seconds", 0.05)
-
-    with caplog.at_level(logging.WARNING, logger="penumbra.worker"):
-        # Idle: nothing in flight, however stale the last completion is.
-        monkeypatch.setattr(worker.settings, "stall_warning_seconds", 0.0)
-        monkeypatch.setattr(worker, "last_completion", monotonic() - 10_000)
-        task = asyncio.create_task(worker.warn_if_stalled(set(), 10))
-        await asyncio.sleep(0.12)
-        task.cancel()
-
-        # Busy, but completing well inside the window.
-        monkeypatch.setattr(worker.settings, "stall_warning_seconds", 3600.0)
-        monkeypatch.setattr(worker, "last_completion", monotonic())
-        task = asyncio.create_task(worker.warn_if_stalled({MagicMock()}, 10))
-        await asyncio.sleep(0.12)
-        task.cancel()
-
-    assert caplog.records == []
-
-
-@pytest.mark.asyncio
-async def test_warn_if_stalled_exits_on_shutdown(monkeypatch, fresh_shutdown_event):
-    """Returns promptly on shutdown rather than blocking it for a full interval."""
-    monkeypatch.setattr(worker.settings, "stall_check_interval_seconds", 60.0)
-
-    task = asyncio.create_task(worker.warn_if_stalled(set(), 1))
-    await asyncio.sleep(0)
-    fresh_shutdown_event.set()
-    await asyncio.wait_for(task, timeout=5)
+    settings = worker.Settings()
+    assert settings.page_task_stall_seconds > settings.task_timeout_seconds

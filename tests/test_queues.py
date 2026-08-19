@@ -1,4 +1,5 @@
 import asyncio
+import json
 from contextlib import suppress
 from time import monotonic
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -7,6 +8,7 @@ import pytest
 from prometheus_client import REGISTRY
 
 from penumbra import metrics
+from penumbra.models import UmbraMessage, UmbraResponse
 from penumbra.queues import AsyncMessageClient
 
 # Outer guard on the bounded-publish tests, so a regression hangs the test rather
@@ -16,26 +18,49 @@ from penumbra.queues import AsyncMessageClient
 GUARD_TIMEOUT = 5.0
 
 
+def declaring_channel(channels: list | None = None) -> MagicMock:
+    """
+    One channel that declares whatever is asked of it.
+
+    The declared queue and exchange carry the channel they were declared on, as
+    the real objects do: `is_usable` reads `queue.channel.is_closed` to notice a
+    channel the broker closed while leaving the connection up.
+    """
+    channel = MagicMock()
+    channel.is_closed = False
+    channel.ready = AsyncMock()
+    channel.set_qos = AsyncMock()
+    channel.declare_queue = AsyncMock(
+        return_value=MagicMock(bind=AsyncMock(), channel=channel)
+    )
+    channel.declare_exchange = AsyncMock(
+        return_value=MagicMock(channel=channel, publish=AsyncMock())
+    )
+    if channels is not None:
+        channels.append(channel)
+    return channel
+
+
 def connection_mock(channel_side_effect=None) -> MagicMock:
     """
     A broker connection whose channels declare everything successfully.
 
     `channel_side_effect` replaces `connection.channel`, so a test can make the
     setup that follows the connect hang or fail.
+
+    The channels handed out are collected on `connection.declared_channels`, so a
+    test can close one out from under the client.
     """
     connection = MagicMock()
     connection.is_closed = False
     connection.close = AsyncMock()
-
-    def new_channel(*args, **kwargs):
-        channel = MagicMock()
-        channel.set_qos = AsyncMock()
-        channel.declare_queue = AsyncMock(return_value=MagicMock(bind=AsyncMock()))
-        channel.declare_exchange = AsyncMock()
-        return channel
+    channels: list = []
+    connection.declared_channels = channels
 
     if channel_side_effect is None:
-        connection.channel = AsyncMock(side_effect=new_channel)
+        connection.channel = AsyncMock(
+            side_effect=lambda *a, **k: declaring_channel(channels)
+        )
     else:
         connection.channel = AsyncMock(side_effect=channel_side_effect)
     return connection
@@ -50,16 +75,9 @@ async def test_connect_declares_queue_and_exchange_on_separate_channels():
     an unbounded in-process buffer.
     """
     channels = []
-
-    def new_channel(*args, **kwargs):
-        channel = MagicMock()
-        channel.set_qos = AsyncMock()
-        channel.declare_queue = AsyncMock(return_value=MagicMock(bind=AsyncMock()))
-        channel.declare_exchange = AsyncMock()
-        channels.append(channel)
-        return channel
-
-    connection = connection_mock(channel_side_effect=new_channel)
+    connection = connection_mock(
+        channel_side_effect=lambda *a, **k: declaring_channel(channels)
+    )
     client = AsyncMessageClient(prefetch_count=7, connect_timeout=11.0)
     connect_robust = AsyncMock(return_value=connection)
 
@@ -258,6 +276,147 @@ async def test_publish_timeout_covers_the_connect_as_well_as_the_publish():
             )
     # It was the client's own 0.1s deadline that fired, not the outer guard.
     assert monotonic() - started < 1
+
+
+@pytest.mark.asyncio
+async def test_connect_rebuilds_when_a_channel_dies_under_a_live_connection():
+    """
+    The failure this guard exists for. The broker closed both channels while the
+    connection stayed up, so `connection.is_closed` was False and the old check
+    handed the dead exchange to every publish and the dead queue to every ack for
+    the life of the process -- with the gauge still reading 1 throughout, because
+    it only ever moved on connection-close callbacks.
+    """
+    first, second = connection_mock(), connection_mock()
+    connect_robust = AsyncMock(side_effect=[first, second])
+    client = AsyncMessageClient(recovery_timeout=0.05)
+    metrics.penumbra_broker_connected.set(0)
+
+    with patch("aio_pika.connect_robust", connect_robust):
+        await client.connect()
+        assert client.connection is first
+
+        # The broker closes the channels and aio-pika never brings them back. The
+        # connection itself is untouched, which is the whole difficulty.
+        for channel in first.declared_channels:
+            channel.is_closed = True
+
+        queue, exchange = await client.connect()
+
+    assert connect_robust.await_count == 2
+    assert client.connection is second
+    assert queue is client.queue and exchange is client.exchange
+    assert REGISTRY.get_sample_value("penumbra_broker_connected") == 1
+    # The connection we gave up on is closed rather than dropped: a
+    # RobustConnection owns a reconnect task that outlives every reference to it.
+    first.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_connect_lets_aio_pika_restore_a_channel_before_rebuilding():
+    """
+    A RobustChannel reopens itself after the broker closes it, so a transient close
+    must not cost a new connection: rebuilding on every one would churn connections
+    and race the library's own recovery, which usually works.
+    """
+    connection = connection_mock()
+    connect_robust = AsyncMock(return_value=connection)
+    client = AsyncMessageClient(recovery_timeout=5.0)
+    metrics.penumbra_broker_connected.set(0)
+
+    with patch("aio_pika.connect_robust", connect_robust):
+        await client.connect()
+        channels = list(connection.declared_channels)
+
+        async def restore():
+            for channel in channels:
+                channel.is_closed = False
+
+        for channel in channels:
+            channel.is_closed = True
+            channel.ready = AsyncMock(side_effect=restore)
+
+        await client.connect()
+
+    # Recovered in place: one connection, and the gauge back up.
+    assert connect_robust.await_count == 1
+    assert client.connection is connection
+    connection.close.assert_not_awaited()
+    assert REGISTRY.get_sample_value("penumbra_broker_connected") == 1
+
+
+@pytest.mark.asyncio
+async def test_publish_recovers_after_the_broker_closes_the_publish_channel():
+    """
+    End to end, and the reason this matters at all: a publish landing on a dead
+    channel used to fail forever, because `connect` handed the same dead exchange
+    back on every attempt. All three tries in `publish_with_retry` failed inside a
+    second and the URL was dropped -- for every URL, indefinitely.
+    """
+    first, second = connection_mock(), connection_mock()
+    client = AsyncMessageClient(recovery_timeout=0.05)
+    response = MagicMock(client_id="urls")
+    response.asdict.return_value = {"url": "https://example.com"}
+
+    with patch("aio_pika.connect_robust", AsyncMock(side_effect=[first, second])):
+        await client.connect()
+        dead_exchange = client.exchange
+        for channel in first.declared_channels:
+            channel.is_closed = True
+
+        await client.publish_message(response)
+
+    # It went out on the rebuilt exchange, not the dead one.
+    assert client.connection is second
+    assert client.exchange is not dead_exchange
+    client.exchange.publish.assert_awaited_once()
+    dead_exchange.publish.assert_not_awaited()
+    assert REGISTRY.get_sample_value("penumbra_amqp_topology_rebuilds_total") >= 1
+
+
+@pytest.mark.asyncio
+async def test_publish_body_is_json_with_real_nulls():
+    """
+    Heritrix reads these with org.json, whose tokeniser accepts a Python dict repr
+    -- single quotes and all -- which is why `str(dict)` went unnoticed for years.
+    What it does not accept is `None`: only true/false/null are special-cased, so a
+    bare `None` comes back as the *string* "None" and AMQPUrlReceiver tags the URL
+    with a source of "None" instead of leaving it unset.
+    """
+    parent = UmbraMessage(
+        {
+            "url": "https://example.com/page",
+            "clientId": "sample_crawl",
+            # No "source": exactly the case that used to serialise as None.
+            "metadata": {
+                "pathFromSeed": "L",
+                "heritableData": {"heritable": ["source", "heritable"]},
+            },
+        }
+    )
+    response = UmbraResponse(
+        url="https://example.com/a.js", method="GET", headers={}, parent_message=parent
+    )
+
+    connection = connection_mock()
+    client = AsyncMessageClient()
+
+    with patch("aio_pika.connect_robust", AsyncMock(return_value=connection)):
+        await client.connect()
+        await client.publish_message(response)
+
+    (message,), kwargs = client.exchange.publish.call_args
+    body = json.loads(message.body)  # would raise on a Python dict repr
+
+    assert kwargs["routing_key"] == "sample_crawl"
+    assert body["url"] == "https://example.com/a.js"
+    assert body["parentUrl"] == "https://example.com/page"
+    # A real null, so Heritrix leaves the source unset rather than storing "None".
+    assert body["parentUrlMetadata"]["heritableData"]["source"] is None
+    assert body["parentUrlMetadata"]["heritableData"]["heritable"] == [
+        "source",
+        "heritable",
+    ]
 
 
 @pytest.mark.asyncio
