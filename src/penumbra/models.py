@@ -182,7 +182,20 @@ class HeritableData:
         return f"source:{self.source} heritable:{self.heritable}"
 
     def asdict(self) -> dict:
-        return asdict(self)
+        # Omit an absent source rather than emitting `"source": null`. Heritrix
+        # parses these with org.json, which maps a JSON null to the
+        # `JSONObject.NULL` sentinel rather than to Java null, and
+        # AMQPUrlReceiver.populateHeritableMetadata copies every key of
+        # heritableData into the CrawlURI's data map without an isNull() check.
+        # The sentinel then satisfies the `containsDataKey` guard on every
+        # consumer of the source tag -- the crawl log, the stats tracker, the
+        # WARC writer -- each of which casts the value straight to String, so
+        # the URL takes a ClassCastException instead of going untagged.
+        # Leaving the key out is what "unset" means to that code.
+        data = asdict(self)
+        if self.source is None:
+            del data["source"]
+        return data
 
 
 @dataclass

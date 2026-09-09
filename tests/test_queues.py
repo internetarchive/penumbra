@@ -375,13 +375,17 @@ async def test_publish_recovers_after_the_broker_closes_the_publish_channel():
 
 
 @pytest.mark.asyncio
-async def test_publish_body_is_json_with_real_nulls():
+async def test_publish_body_omits_absent_source():
     """
-    Heritrix reads these with org.json, whose tokeniser accepts a Python dict repr
-    -- single quotes and all -- which is why `str(dict)` went unnoticed for years.
-    What it does not accept is `None`: only true/false/null are special-cased, so a
-    bare `None` comes back as the *string* "None" and AMQPUrlReceiver tags the URL
-    with a source of "None" instead of leaving it unset.
+    A URL with no source must go out with no `source` key at all.
+
+    Heritrix reads these with org.json, and neither way of spelling "no source"
+    survives that parser. `str(dict)` emitted a bare `None`, which is not one of
+    the true/false/null keywords and so came back as the *string* "None",
+    tagging the URL with a source of "None". `json.dumps` emits a real null,
+    which org.json maps to the `JSONObject.NULL` sentinel -- worse, because it
+    satisfies the `containsDataKey` guard on every source-tag consumer and then
+    fails their unchecked cast to String. Only omitting the key reads as unset.
     """
     parent = UmbraMessage(
         {
@@ -411,12 +415,45 @@ async def test_publish_body_is_json_with_real_nulls():
     assert kwargs["routing_key"] == "sample_crawl"
     assert body["url"] == "https://example.com/a.js"
     assert body["parentUrl"] == "https://example.com/page"
-    # A real null, so Heritrix leaves the source unset rather than storing "None".
-    assert body["parentUrlMetadata"]["heritableData"]["source"] is None
-    assert body["parentUrlMetadata"]["heritableData"]["heritable"] == [
-        "source",
-        "heritable",
-    ]
+    # The key is absent, not null. A JSON null would reach Heritrix as
+    # org.json's JSONObject.NULL sentinel, which passes the `containsDataKey`
+    # guard on every source-tag consumer and then fails their cast to String.
+    heritable_data = body["parentUrlMetadata"]["heritableData"]
+    assert "source" not in heritable_data
+    assert heritable_data["heritable"] == ["source", "heritable"]
+
+
+@pytest.mark.asyncio
+async def test_publish_body_preserves_present_source():
+    """The common case: a real source is inherited by the outlink unchanged."""
+    parent = UmbraMessage(
+        {
+            "url": "https://example.com/page",
+            "clientId": "sample_crawl",
+            "metadata": {
+                "pathFromSeed": "L",
+                "heritableData": {
+                    "source": "https://example.com/",
+                    "heritable": ["source", "heritable"],
+                },
+            },
+        }
+    )
+    response = UmbraResponse(
+        url="https://example.com/a.js", method="GET", headers={}, parent_message=parent
+    )
+
+    connection = connection_mock()
+    client = AsyncMessageClient()
+
+    with patch("aio_pika.connect_robust", AsyncMock(return_value=connection)):
+        await client.connect()
+        await client.publish_message(response)
+
+    (message,), _ = client.exchange.publish.call_args
+    body = json.loads(message.body)
+
+    assert body["parentUrlMetadata"]["heritableData"]["source"] == "https://example.com/"
 
 
 @pytest.mark.asyncio
