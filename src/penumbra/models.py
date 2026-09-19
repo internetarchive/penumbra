@@ -18,10 +18,12 @@ class Settings(BaseSettings):
     amqp_exchange_name: str = Field(default="umbra")
     amqp_connect_timeout_seconds: float = Field(default=60.0, gt=0)
     # How long to let aio-pika restore a channel the broker closed before giving
-    # up on it and rebuilding the connection. A robust channel normally reopens
-    # itself, so this is a grace period rather than a limit -- but the recovery is
-    # not guaranteed, and without an end to the waiting a dead channel under a
-    # live connection stops the instance consuming for the life of the process.
+    # up on the publish. A robust channel normally reopens itself, so this is a
+    # grace period rather than a limit -- but the recovery is not guaranteed, and
+    # without an end to the waiting a dead channel under a live connection stops
+    # the instance consuming for the life of the process. Failing is the whole
+    # fallback: the connection is never replaced under a live consumer, so a
+    # topology that does not recover is `watch_broker`'s problem, not `connect`'s.
     # Kept below `publish_timeout_seconds`, which encloses it on the publish path.
     amqp_recovery_timeout_seconds: float = Field(default=10.0, gt=0)
     # Grace period for in-progress page tasks at shutdown. Deliberately well under
@@ -36,41 +38,19 @@ class Settings(BaseSettings):
     # exits for the supervisor to restart it. Comfortably longer than
     # `amqp_recovery_timeout_seconds` and than a broker restart, so an outage that
     # resolves itself never costs a restart -- but far short of the ten hours the
-    # August outages spent sitting idle. See `watch_broker`.
+    # August outages spent sitting idle. This is the only thing that recovers a
+    # topology aio-pika could not restore in place, since `connect` will not
+    # replace the connection under a live consumer. See `watch_broker`.
     broker_unhealthy_exit_seconds: float = Field(default=300.0, gt=0)
     # Heritrix rejects URLs longer than its UURI limit (2083 chars), so drop
     # over-length URLs before enqueueing rather than publishing dead links.
     max_url_length: int = Field(default=2083, ge=1)
-    # Put a failed message back on the queue for another attempt.
-    #
-    # EXPERIMENTAL, and off by default: this is the setting most likely to take
-    # an instance down. A requeued message goes back to the head of the queue and
-    # is redelivered immediately, so a URL that fails the same way every time
-    # loops as fast as it can fail. With only
-    # `browser_pool_size * contexts_per_browser` slots, a handful of those
-    # occupy every one of them while the real backlog waits, and the process
-    # stays up and healthy-looking throughout. Every redelivery loop seen in
-    # production so far has started this way.
-    #
-    # Off, a retryable failure loses that page's links outright. That is the
-    # cheaper mistake: Heritrix fetches the URL itself regardless of what
-    # penumbra reports, so what is lost is the links from one page rather than
-    # an instance's throughput. Turn it on only while watching
-    # `penumbra_pages_failed`.
-    enable_page_retries: bool = Field(default=False)
     # Time to wait for a server to respond to the initial request
     navigation_timeout_seconds: float = Field(default=30.0, gt=0)
     # Time to wait for a page to be considered finished requestion resources. After this,
     # outlinks a send regardless of current page status
     page_timeout_seconds: float = Field(default=120.0, gt=0)
     context_close_timeout_seconds: float = Field(default=30.0, gt=0)
-    # Returning a page's links to Heritrix. Deliberately outside the browser
-    # deadline, so a slow broker is not charged to the page and misreported as a
-    # page timeout -- which means it needs a bound of its own. Publishes run
-    # concurrently and each is already bounded by `publish_timeout_seconds` with
-    # `publish_max_attempts` retries, so the natural worst case is around 92s;
-    # this sits above that as a backstop rather than a limiter.
-    outlink_publish_timeout_seconds: float = Field(default=120.0, gt=0)
     amqp_ack_timeout_seconds: float = Field(default=30.0, gt=0)
     publish_timeout_seconds: float = Field(default=30.0, gt=0)
     publish_max_attempts: int = Field(default=3, ge=1)
@@ -117,37 +97,37 @@ class Settings(BaseSettings):
 
     @computed_field
     @cached_property
+    def outlink_publish_bound_seconds(self) -> float:
+        """
+        How long returning one page's links can take, at worst.
+
+        Not a deadline -- nothing enforces this. It is the natural bound of the
+        retry ladder in `publish_with_retry`: every attempt is capped by
+        `publish_timeout_seconds` and the sleeps between them double from
+        `publish_retry_base_delay_seconds`. Publishes run concurrently, so the
+        page pays this once rather than once per URL. Exists so that
+        `task_timeout_seconds` tracks the ladder instead of a hardcoded guess.
+        """
+        backoff = self.publish_retry_base_delay_seconds * (
+            2 ** (self.publish_max_attempts - 1) - 1
+        )
+        return self.publish_max_attempts * self.publish_timeout_seconds + backoff
+
+    @computed_field
+    @cached_property
     def task_timeout_seconds(self) -> float:
         """
         Backstop deadline for a whole page task, covering the browser deadline
-        plus the bounded publish and cleanup that run after it. Only reached if
-        one of the inner deadlines fails to do its job.
+        plus the publish and cleanup that run after it. Only reached if one of
+        the inner deadlines fails to do its job.
         """
         return (
             self.browser_deadline_seconds
-            + self.outlink_publish_timeout_seconds
+            + self.outlink_publish_bound_seconds
             + self.context_close_timeout_seconds
             + self.amqp_ack_timeout_seconds
             + 30.0
         )
-
-    @computed_field
-    @cached_property
-    def page_task_stall_seconds(self) -> float:
-        """
-        How long a single page task may run before the watchdog calls it stuck.
-
-        Derived rather than configured, so it cannot be set below the backstop it
-        is checking. `run_page_task` wraps every page in `task_timeout_seconds`,
-        so no task should ever reach this: getting here means the `wait_for`
-        itself failed to fire -- a cancellation the page never honoured -- and the
-        semaphore permit it holds is gone for the life of the process.
-
-        The margin is generous because the cost of a false positive is a restart
-        of a working instance, while the cost of a slow true positive is one slot
-        out of `max_concurrency` for a few more minutes.
-        """
-        return self.task_timeout_seconds + 300.0
 
     @computed_field
     @cached_property

@@ -15,6 +15,20 @@ logger = logging.getLogger(__name__)
 DISCARD_CLOSE_TIMEOUT = 10.0
 
 
+class TopologyUnusable(Exception):
+    """
+    The cached topology is dead and this process cannot replace it.
+
+    Raised instead of rebuilding, because the consume loop's message iterator
+    holds the `queue` object it was created from: swapping the connection out
+    from under it would leave this instance consuming a channel that no longer
+    exists while `is_usable` reported the replacement as healthy. Publishes fail
+    on this and are counted; if the topology does not recover, `watch_broker`
+    exits the process and the supervisor brings back an instance whose consumer
+    and topology agree.
+    """
+
+
 class AsyncMessageClient:
     def __init__(
         self,
@@ -38,7 +52,7 @@ class AsyncMessageClient:
         :param publish_timeout: seconds to wait for a publish confirm
         :param connect_timeout: seconds to wait for a connection to become usable
         :param recovery_timeout: seconds to let aio-pika restore a dead channel
-            before giving up on it and rebuilding from scratch
+            in place before failing the publish that was waiting on it
         """
         self.amqp_url = amqp_url
         self.queue_name = queue_name
@@ -92,7 +106,7 @@ class AsyncMessageClient:
         Bounded because that recovery is not guaranteed. `RobustChannel._on_close`
         skips the restore entirely if a previous restore left it part-way
         (`__restored` cleared), and nothing clears that state again on its own --
-        so the wait has to end in a rebuild rather than in more waiting.
+        so the wait has to end in a verdict rather than in more waiting.
         """
         try:
             async with asyncio.timeout(self.recovery_timeout):
@@ -101,31 +115,24 @@ class AsyncMessageClient:
                     if ready is not None:
                         await ready()
         # Broad on purpose: this is a probe, and its answer is the return value.
-        # Whatever went wrong, the caller's next move is to rebuild. CancelledError
-        # is a BaseException, so an enclosing deadline still aborts the wait.
+        # Whatever went wrong, the caller's next move is the same -- fail the
+        # publish. CancelledError is a BaseException, so an enclosing deadline
+        # still aborts the wait.
         except Exception:
             return False
         return self.is_usable()
 
-    async def _rebuild(self) -> None:
+    async def _build(self) -> None:
         """
-        Build a fresh connection and topology, discarding anything cached.
+        Build the connection and topology this process will use.
+
+        Runs once, on the first `connect`, and again only if that attempt raised
+        -- which leaves `self.connection` None, because the three attributes are
+        published together at the end or not at all. There is deliberately no
+        path that replaces a live connection: see `TopologyUnusable`.
 
         Callers hold `_connect_lock`.
         """
-        stale, self.connection, self.queue, self.exchange = (
-            self.connection,
-            None,
-            None,
-            None,
-        )
-        if stale is not None:
-            # Closed rather than simply dropped: a RobustConnection owns a
-            # reconnect task that outlives every reference to it, so abandoning
-            # one leaks a task that goes on retrying forever behind the
-            # connection replacing it.
-            await self._discard(stale)
-
         # `timeout` bounds the handshake, and `connect_robust` reuses it
         # for each later reconnect attempt. Without it a broker that
         # accepts TCP and then goes quiet blocks here forever.
@@ -187,7 +194,7 @@ class AsyncMessageClient:
             if self.connection is None:
                 # First call, or a previous attempt that cached nothing. There is
                 # no topology to recover, so go straight to building one.
-                await self._rebuild()
+                await self._build()
             elif not self.is_usable():
                 # The gauge is what distinguishes "up but not consuming" from an
                 # idle queue.
@@ -200,23 +207,31 @@ class AsyncMessageClient:
                     self.connection is not None and not self.connection.is_closed,
                     self.recovery_timeout,
                 )
-                if await self._await_recovery():
-                    logger.info(
-                        "AMQP topology for queue %s restored without a rebuild.",
-                        self.queue_name,
-                    )
-                    metrics.penumbra_broker_connected.set(1)
-                else:
+                if not await self._await_recovery():
+                    # Recovery is in place -- `RobustChannel` reopens the same
+                    # channel object -- so it is safe for the consume loop's
+                    # iterator. Building a *replacement* connection is not, which
+                    # is why that is not the fallback here.
                     logger.error(
-                        "AMQP topology for queue %s did not come back within %ss; "
-                        "rebuilding the connection. Left alone this is the state "
-                        "that stops an instance consuming indefinitely while the "
-                        "process stays up.",
+                        "AMQP topology for queue %s did not come back within %ss. "
+                        "Failing this publish rather than replacing the "
+                        "connection: the consume loop's iterator holds the queue "
+                        "object it was created from, so a replacement would leave "
+                        "this instance consuming a dead channel while every health "
+                        "check read the new topology and said fine. If it stays "
+                        "unusable, watch_broker exits for the supervisor.",
                         self.queue_name,
                         self.recovery_timeout,
                     )
-                    metrics.penumbra_amqp_topology_rebuilds.inc(1)
-                    await self._rebuild()
+                    raise TopologyUnusable(
+                        f"AMQP topology for queue {self.queue_name} is unusable "
+                        f"and did not recover within {self.recovery_timeout}s"
+                    )
+                logger.info(
+                    "AMQP topology for queue %s restored in place.",
+                    self.queue_name,
+                )
+                metrics.penumbra_broker_connected.set(1)
 
         return self.queue, self.exchange
 
