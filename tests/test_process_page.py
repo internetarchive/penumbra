@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-from time import monotonic
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aio_pika
@@ -33,15 +32,6 @@ def fresh_shutdown_event():
     event = asyncio.Event()
     with patch.object(worker, "shutdown_event", event):
         yield event
-
-
-@pytest.fixture
-def page_retries_enabled(monkeypatch):
-    """
-    Retries are off by default, so the requeue paths are unreachable without
-    this. Kept as a fixture so every test that needs it says so in its signature.
-    """
-    monkeypatch.setattr(worker.settings, "enable_page_retries", True)
 
 
 def message_maker(url: str) -> MagicMock:
@@ -208,14 +198,65 @@ async def test_publish_umbra_response_survives_one_bad_url(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_publish_umbra_response_reports_one_line_per_page(monkeypatch, caplog):
+    """
+    The URL count is unbounded, so a line each made the publish path the bulk of
+    the log on a link-heavy crawl. One summary line instead -- and it carries the
+    thing a per-URL line could not, which is how many of them failed.
+    """
+    monkeypatch.setattr(worker.settings, "publish_retry_base_delay_seconds", 0)
+    monkeypatch.setattr(worker.settings, "publish_max_attempts", 1)
+
+    parent_message = UmbraMessage(json.loads(message_maker("https://example.com").body))
+    urls = {f"https://example.com/{n}" for n in range(5)}
+
+    client = MagicMock(spec=AsyncMessageClient)
+    client.publish_message = AsyncMock()
+
+    with caplog.at_level(logging.INFO, logger="penumbra.worker"):
+        await publish_umbra_response(client, parent_message, urls)
+
+    assert "Published 5 links from https://example.com" in caplog.text
+    # One line for the page, not one per URL.
+    assert len(caplog.records) == 1
+
+    caplog.clear()
+    bad = "https://example.com/1"
+
+    async def publish(umbra_response):
+        if umbra_response.url == bad:
+            raise ConnectionError("boom")
+
+    client.publish_message = AsyncMock(side_effect=publish)
+
+    with caplog.at_level(logging.WARNING, logger="penumbra.worker"):
+        await publish_umbra_response(client, parent_message, urls)
+
+    # A partial publish is a warning, and says how much was lost.
+    assert "Published 4 of 5 links from https://example.com" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_publish_umbra_response_says_nothing_when_there_is_nothing_to_publish():
+    """A page whose every URL was dropped for length gets no summary line."""
+    parent_message = UmbraMessage(json.loads(message_maker("https://example.com").body))
+    client = MagicMock(spec=AsyncMessageClient)
+    client.publish_message = AsyncMock()
+
+    await publish_umbra_response(client, parent_message, set())
+
+    client.publish_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_browser_deadline_catches_a_hang_in_the_untimed_setup_calls(
     monkeypatch, caplog
 ):
     """
     Both crawl phases carry their own timeout, so the outer deadline can only
-    fire on the untimed protocol calls -- a wedged browser. Terminal, with
-    nothing published and nothing retried, so the log line and the counter are
-    the only signs the pool has gone bad.
+    fire on the untimed protocol calls -- a wedged browser. Nothing is
+    published, so the log line and the counter are the only signs the pool has
+    gone bad.
 
     The context is closed either way, so the task returns and its semaphore
     permit and in-progress gauge are released.
@@ -226,7 +267,6 @@ async def test_browser_deadline_catches_a_hang_in_the_untimed_setup_calls(
 
     message = message_maker("https://example.com")
     message.ack = AsyncMock()
-    message.nack = AsyncMock()
 
     async def hang(*args, **kwargs):
         await asyncio.sleep(60)
@@ -243,7 +283,6 @@ async def test_browser_deadline_catches_a_hang_in_the_untimed_setup_calls(
         await asyncio.wait_for(process_page(client, browser, message), timeout=10)
 
     message.ack.assert_awaited_once()
-    message.nack.assert_not_awaited()
     # Nothing was published: there was nothing to publish.
     client.publish_message.assert_not_called()
     assert failed_pages_total("browser_stuck") == stuck_pre + 1
@@ -268,21 +307,16 @@ def page_browser_mock() -> MagicMock:
 
 
 @pytest.mark.asyncio
-async def test_process_page_never_nacks_a_message_it_has_acked(monkeypatch):
+async def test_process_page_is_not_held_up_by_a_stalled_ack(monkeypatch):
     """
-    `ack()` queues the Basic.Ack frame and only then awaits the drain. An ack
-    that stalls on that drain must not be followed by a nack: the broker answers
-    PRECONDITION_FAILED for an already-acked delivery tag and closes the consume
-    channel, which stops this instance consuming entirely.
-
-    The settle step now sits outside the page deadline and picks exactly one of
-    ack/nack, so this is structural rather than guarded by a flag. The test
-    stays because it is the invariant, not the implementation.
+    `ack()` queues the Basic.Ack frame and only then awaits the drain, so a
+    blocked connection can leave the settle step outstanding indefinitely.
+    Nothing may be waited on unbounded here: the page is finished and the task
+    still holds one of the few semaphore permits.
     """
     monkeypatch.setattr(worker.settings, "amqp_ack_timeout_seconds", 0.1)
 
     message = message_maker("https://example.com")
-    message.nack = AsyncMock()
 
     async def hang():
         await asyncio.sleep(60)
@@ -299,17 +333,19 @@ async def test_process_page_never_nacks_a_message_it_has_acked(monkeypatch):
     )
 
     message.ack.assert_awaited_once()
-    message.nack.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_process_page_still_nacks_when_the_page_fails_before_the_ack(
-    page_retries_enabled,
-):
-    """An unrecognised failure is retryable, so with retries on it is requeued."""
+async def test_process_page_settles_a_page_that_fails_before_the_ack(caplog):
+    """
+    A failure on the crawl path must still reach the settle step. Stranding the
+    delivery would hold the prefetch slot until the consumer goes away.
+
+    Nothing recognised this one, so it is labelled with the exception's class
+    name and logged with the traceback that is the only way to identify it.
+    """
     message = message_maker("https://example.com")
     message.ack = AsyncMock()
-    message.nack = AsyncMock()
 
     browser = page_browser_mock()
     context = await browser.new_context()
@@ -317,25 +353,27 @@ async def test_process_page_still_nacks_when_the_page_fails_before_the_ack(
         side_effect=RuntimeError("navigation failed")
     )
 
-    client = MagicMock(spec=AsyncMessageClient)
-    await process_page(client, browser, message)
+    failed_pre = failed_pages_total("RuntimeError")
 
-    message.ack.assert_not_awaited()
-    message.nack.assert_awaited_once_with(requeue=True)
+    client = MagicMock(spec=AsyncMessageClient)
+    with caplog.at_level(logging.WARNING, logger="penumbra.worker"):
+        await process_page(client, browser, message)
+
+    message.ack.assert_awaited_once()
+    assert failed_pages_total("RuntimeError") == failed_pre + 1
+    assert "Exception while processing page" in caplog.text
+    assert "RuntimeError: navigation failed" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_process_page_does_not_count_an_unrelated_timeout_as_a_page_timeout(
-    page_retries_enabled,
-):
+async def test_process_page_does_not_count_an_unrelated_timeout_as_a_page_timeout():
     """
     The builtin TimeoutError is an OSError subclass that aio-pika can raise from a
-    socket operation. Only the page deadline actually expiring may increment
-    `penumbra_page_timeouts`, or the metric stops meaning what it says.
+    socket operation. Only a page that really ran out of its own budget may be
+    counted under `page_timeout`, or that reason stops meaning what it says.
     """
     message = message_maker("https://example.com")
     message.ack = AsyncMock()
-    message.nack = AsyncMock()
 
     browser = page_browser_mock()
     context = await browser.new_context()
@@ -344,14 +382,16 @@ async def test_process_page_does_not_count_an_unrelated_timeout_as_a_page_timeou
         side_effect=TimeoutError("socket timed out")
     )
 
-    timeouts_pre = REGISTRY.get_sample_value("penumbra_page_timeouts_total") or 0
+    page_timeouts_pre = failed_pages_total("page_timeout")
+    failed_pre = failed_pages_total("TimeoutError")
 
     client = MagicMock(spec=AsyncMessageClient)
     await process_page(client, browser, message)
 
-    assert REGISTRY.get_sample_value("penumbra_page_timeouts_total") == timeouts_pre
-    # Still treated as a failure: the message goes back to the queue.
-    message.nack.assert_awaited_once_with(requeue=True)
+    assert failed_pages_total("page_timeout") == page_timeouts_pre
+    # Still treated as a failure, just not that one.
+    assert failed_pages_total("TimeoutError") == failed_pre + 1
+    message.ack.assert_awaited_once()
 
 
 def failed_pages_total(reason: str) -> float:
@@ -365,7 +405,6 @@ async def run_failing_page(error: Exception) -> MagicMock:
     """Drive one page whose `goto` raises, and hand back the message."""
     message = message_maker("https://example.com")
     message.ack = AsyncMock()
-    message.nack = AsyncMock()
 
     browser = page_browser_mock()
     context = await browser.new_context()
@@ -389,38 +428,60 @@ async def run_failing_page(error: Exception) -> MagicMock:
     ],
 )
 @pytest.mark.asyncio
-async def test_process_page_drops_permanently_unreachable_pages(message_text, reason):
+async def test_process_page_drops_permanently_unreachable_pages(
+    message_text, reason, caplog
+):
     """
-    A site whose certificate or DNS is broken fails the same way on every
-    redelivery. Requeueing it spun those URLs through the prefetch slots in a
-    tight loop and starved the real backlog, so the message is acked away.
+    A page whose certificate or DNS is broken is not going to load. Counted
+    under the net error as its own reason, and logged without a traceback: these
+    are numerous and fully described by that reason.
     """
     dropped_pre = failed_pages_total(reason)
 
-    message = await run_failing_page(PlaywrightError(message_text))
+    with caplog.at_level(logging.INFO, logger="penumbra.worker"):
+        message = await run_failing_page(PlaywrightError(message_text))
 
     message.ack.assert_awaited_once()
-    message.nack.assert_not_awaited()
+    assert f"Unreachable page ({reason})" in caplog.text
     assert failed_pages_total(reason) == dropped_pre + 1
 
 
 @pytest.mark.asyncio
-async def test_process_page_requeues_a_net_error_that_is_our_end_of_the_wire(
-    page_retries_enabled,
+async def test_process_page_keeps_the_hops_a_failed_navigation_redirected_through(
+    caplog,
 ):
     """
-    Not every `net::` error is the site's fault. Losing our own connectivity says
-    nothing about the URL, so those stay retryable.
+    A navigation that redirects and then dies at connect has still discovered
+    every URL it was redirected to, and `outlinks_from` calls those real
+    discoveries. They used to be thrown away with the failure; the page's own
+    URL is the only one Heritrix already knows about, and that is dropped
+    separately.
     """
-    requeued_pre = failed_pages_total("ERR_INTERNET_DISCONNECTED")
+    message = message_maker("https://example.com")
+    message.ack = AsyncMock()
 
-    message = await run_failing_page(
-        PlaywrightError("Page.goto: net::ERR_INTERNET_DISCONNECTED at https://x/")
-    )
+    browser = page_browser_mock()
+    context = await browser.new_context()
+    page = context.new_page.return_value
 
-    message.nack.assert_awaited_once_with(requeue=True)
-    message.ack.assert_not_awaited()
-    assert failed_pages_total("ERR_INTERNET_DISCONNECTED") == requeued_pre + 1
+    async def redirect_then_reset(*args, **kwargs):
+        for url in ("https://example.com/", "https://redirected.example/landing"):
+            page.on.call_args_list[0].args[1](MagicMock(url=url))
+        raise PlaywrightError("Page.goto: net::ERR_CONNECTION_RESET at https://x/")
+
+    page.goto = AsyncMock(side_effect=redirect_then_reset)
+
+    client = MagicMock(spec=AsyncMessageClient)
+    client.publish_message = AsyncMock()
+
+    with caplog.at_level(logging.INFO, logger="penumbra.worker"):
+        await process_page(client, browser, message)
+
+    assert [call.args[0].url for call in client.publish_message.await_args_list] == [
+        "https://redirected.example/landing"
+    ]
+    message.ack.assert_awaited_once()
+    assert "keeping the 1 links it found" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -428,7 +489,7 @@ async def test_process_page_drops_a_page_that_never_finished_navigating():
     """
     Playwright's TimeoutError means `goto` had its full navigation budget and got
     nothing. Distinct from the builtin TimeoutError our own deadline raises,
-    which stays retryable because a wedged browser looks the same.
+    which means a wedged browser rather than a slow site.
     """
     dropped_pre = failed_pages_total("navigation_timeout")
 
@@ -437,57 +498,39 @@ async def test_process_page_drops_a_page_that_never_finished_navigating():
     )
 
     message.ack.assert_awaited_once()
-    message.nack.assert_not_awaited()
     assert failed_pages_total("navigation_timeout") == dropped_pre + 1
 
 
 @pytest.mark.asyncio
-async def test_process_page_requeues_only_browser_side_playwright_errors(
-    page_retries_enabled,
-):
+async def test_process_page_settles_a_browser_side_failure(caplog):
     """
-    Playwright reports these only in the message text, and requeueing is opt-in:
-    a dead browser is worth another attempt, anything else is not.
+    A dead browser handle is this process's problem rather than the URL's, but
+    the page is settled like any other: Heritrix crawls the URL itself
+    regardless of what penumbra reports. The counter under its own reason is
+    what shows the pool has gone bad.
     """
-    message = await run_failing_page(
-        PlaywrightError("Target page, context or browser has been closed")
-    )
-    message.nack.assert_awaited_once_with(requeue=True)
-    message.ack.assert_not_awaited()
-    assert failed_pages_total("target_closed") > 0
-
-
-@pytest.mark.asyncio
-async def test_nothing_is_requeued_by_default(caplog):
-    """
-    Retries are off unless asked for, so out of the box every message is settled
-    exactly once -- even the failures a retry could plausibly get past. The page
-    is still counted under its own reason and reported, not silently dropped.
-    """
-    assert worker.settings.enable_page_retries is False
-
     closed_pre = failed_pages_total("target_closed")
 
-    with caplog.at_level(logging.WARNING, logger="penumbra.worker"):
+    with caplog.at_level(logging.INFO, logger="penumbra.worker"):
         message = await run_failing_page(
             PlaywrightError("Target page, context or browser has been closed")
         )
 
     message.ack.assert_awaited_once()
-    message.nack.assert_not_awaited()
-    assert "Exception while processing page" in caplog.text
     # Still visible as the browser-side failure it is, not relabelled.
+    assert "Unreachable page (target_closed)" in caplog.text
     assert failed_pages_total("target_closed") == closed_pre + 1
 
 
-def test_retryable_failures_stay_classified_when_retries_are_off():
+def test_browser_side_playwright_errors_get_their_own_reason():
     """
-    The switch is policy, not classification: `retryable` keeps saying what the
-    failure is, so turning retries on later needs no reclassification and the
-    metric reason is the same either way.
+    Playwright reports these only in the message text, and `type(e).__name__` is
+    the bare string "Error" for all of them -- so without the fragment match
+    every one of them collapses into a single useless metric series.
     """
-    assert worker.classify_page_failure(PlaywrightError("Target crashed"), False) == (
-        worker.PageFailure("target_crashed", retryable=True, publish=False)
+    assert (
+        worker.failure_reason(PlaywrightError("Target crashed"), False)
+        == "target_crashed"
     )
 
 
@@ -495,32 +538,30 @@ def test_retryable_failures_stay_classified_when_retries_are_off():
 async def test_process_page_drops_a_url_that_serves_a_download():
     """
     `Page.goto: Download is starting` carries no `net::` code, so the old
-    catch-all called it a browser problem and requeued it -- a hot loop, because
-    a URL with Content-Disposition: attachment does this on every redelivery.
-    There is nothing to extract from the bytes either way.
+    catch-all called it a browser problem -- but a URL with
+    Content-Disposition: attachment does this every time and there is nothing to
+    extract from the bytes either way.
     """
     dropped_pre = failed_pages_total("download_started")
 
     message = await run_failing_page(PlaywrightError("Page.goto: Download is starting"))
 
     message.ack.assert_awaited_once()
-    message.nack.assert_not_awaited()
     assert failed_pages_total("download_started") == dropped_pre + 1
 
 
 @pytest.mark.asyncio
-async def test_process_page_does_not_requeue_an_unrecognised_playwright_error():
+async def test_process_page_drops_an_unrecognised_playwright_error():
     """
-    Unknown is not retryable. Guessing "retry" is what put the cert errors into a
-    hot loop, and the costs are lopsided: a wrong ack loses one page's links,
-    which Heritrix crawls itself anyway, while a wrong requeue starves the queue.
+    A Playwright error with no matching fragment still lands under one shared
+    reason rather than the useless "Error" its class name would give. Counting
+    it is how the next fragment worth matching shows up.
     """
     dropped_pre = failed_pages_total("playwright_error")
 
     message = await run_failing_page(PlaywrightError("Page.goto: something novel"))
 
     message.ack.assert_awaited_once()
-    message.nack.assert_not_awaited()
     assert failed_pages_total("playwright_error") == dropped_pre + 1
 
 
@@ -663,24 +704,15 @@ def test_playwright_error_slugs_stay_bounded():
         'Page.goto: Navigation to "https://example.com/a?x=1" is interrupted by '
         'another navigation to "https://example.com/b?y=2"'
     )
-    assert worker.classify_playwright_message(noisy) == (
-        "navigation_interrupted",
-        False,
-    )
-    assert worker.classify_playwright_message("Page.goto: Download is starting") == (
-        "download_started",
-        False,
+    assert worker.classify_playwright_message(noisy) == "navigation_interrupted"
+    assert (
+        worker.classify_playwright_message("Page.goto: Download is starting")
+        == "download_started"
     )
     # Case-insensitive, and the "Target page, context or browser has been
     # closed" wording is covered by the same fragment.
-    assert worker.classify_playwright_message("TARGET CRASHED") == (
-        "target_crashed",
-        True,
-    )
-    assert worker.classify_playwright_message("anything else") == (
-        "playwright_error",
-        False,
-    )
+    assert worker.classify_playwright_message("TARGET CRASHED") == "target_crashed"
+    assert worker.classify_playwright_message("anything else") == "playwright_error"
 
 
 @pytest.mark.asyncio
@@ -702,36 +734,32 @@ async def test_process_page_refuses_downloads():
     assert browser.new_context.await_args.kwargs["accept_downloads"] is False
 
 
-def test_classify_page_failure_separates_the_two_timeout_classes():
+def test_failure_reason_separates_the_two_timeout_classes():
     """
     Playwright's TimeoutError is not a builtin TimeoutError subclass, which is
     what lets a navigation timeout be told apart from our page deadline. If that
-    ever changes, the ordering in `classify_page_failure` silently inverts.
+    ever changes, the ordering in `failure_reason` silently inverts.
     """
     assert not issubclass(PlaywrightTimeoutError, TimeoutError)
 
-    navigation = worker.classify_page_failure(
+    navigation = worker.failure_reason(
         PlaywrightTimeoutError("Page.goto: Timeout 30000ms exceeded."), False
     )
-    assert navigation == worker.PageFailure(
-        "navigation_timeout", retryable=False, publish=True
-    )
+    assert navigation == "navigation_timeout"
 
     # Phase 2 raises the same Playwright type, so it is re-raised as
     # PageLoadTimeout to stay distinguishable. Checked first for that reason.
-    load = worker.classify_page_failure(PageLoadTimeout("https://example.com"), False)
-    assert load == worker.PageFailure("page_timeout", retryable=False, publish=True)
+    assert worker.failure_reason(PageLoadTimeout("https://example.com"), False) == (
+        "page_timeout"
+    )
 
     # The outer backstop, which now means a wedged browser rather than a slow
     # page: both phases are bounded on their own.
-    stuck = worker.classify_page_failure(TimeoutError("deadline"), True)
-    assert stuck == worker.PageFailure("browser_stuck", retryable=False, publish=True)
+    assert worker.failure_reason(TimeoutError("deadline"), True) == "browser_stuck"
 
     # An unrelated socket timeout, with our deadline still unexpired. Nothing
-    # here says anything about the page, so it is retried and nothing published.
-    assert worker.classify_page_failure(TimeoutError("socket"), False) == (
-        worker.PageFailure("TimeoutError", retryable=True, publish=False)
-    )
+    # recognised it, so it falls through to the class name.
+    assert worker.failure_reason(TimeoutError("socket"), False) == "TimeoutError"
 
 
 @pytest.mark.asyncio
@@ -743,7 +771,6 @@ async def test_process_page_publishes_the_links_a_slow_page_reached():
     """
     message = message_maker("https://example.com")
     message.ack = AsyncMock()
-    message.nack = AsyncMock()
 
     # The document request comes first, as it does on a real page, and is the
     # page's own URL -- so it is dropped rather than handed back to Heritrix.
@@ -771,7 +798,6 @@ async def test_process_page_publishes_the_links_a_slow_page_reached():
     client.publish_message = AsyncMock()
 
     failed_pre = failed_pages_total("page_timeout")
-    timeouts_pre = REGISTRY.get_sample_value("penumbra_page_timeouts_total") or 0
     crawled_pre = REGISTRY.get_sample_value("penumbra_pages_crawled_total") or 0
 
     await asyncio.wait_for(process_page(client, browser, message), timeout=5)
@@ -781,11 +807,9 @@ async def test_process_page_publishes_the_links_a_slow_page_reached():
         == expected
     )
     message.ack.assert_awaited_once()
-    message.nack.assert_not_awaited()
+    # The reason now means "too slow to finish loading", not "wedged".
     assert failed_pages_total("page_timeout") == failed_pre + 1
-    # The counter now means "pages too slow to finish loading", not "wedged".
-    assert REGISTRY.get_sample_value("penumbra_page_timeouts_total") == timeouts_pre + 1
-    # Counted as a completion, so `warn_if_stalled` sees progress.
+    # Counted as a completion, so a stalled instance is still distinguishable.
     assert REGISTRY.get_sample_value("penumbra_pages_crawled_total") == crawled_pre + 1
 
 
@@ -820,7 +844,6 @@ async def test_process_page_keeps_links_from_a_navigation_timeout():
     """A navigation that ran out of time still yields whatever it fetched."""
     message = message_maker("https://example.com")
     message.ack = AsyncMock()
-    message.nack = AsyncMock()
 
     browser = page_browser_mock()
     context = await browser.new_context()
@@ -842,7 +865,6 @@ async def test_process_page_keeps_links_from_a_navigation_timeout():
         client.publish_message.await_args.args[0].url == "https://example.com/img.png"
     )
     message.ack.assert_awaited_once()
-    message.nack.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -853,7 +875,6 @@ async def test_process_page_settles_a_slow_page_even_if_publishing_fails():
     """
     message = message_maker("https://example.com")
     message.ack = AsyncMock()
-    message.nack = AsyncMock()
 
     browser = page_browser_mock()
     context = await browser.new_context()
@@ -877,25 +898,44 @@ async def test_process_page_settles_a_slow_page_even_if_publishing_fails():
 
 
 @pytest.mark.asyncio
-async def test_publish_outlinks_is_bounded(monkeypatch):
+async def test_publish_outlinks_never_raises():
     """
-    Publishing sits outside the page deadline so a slow broker is not charged to
-    the page, which means it needs a bound of its own rather than inheriting one.
+    Publishing must not be able to strand the message: whatever goes wrong here,
+    `process_page` still has to reach the ack and free the slot. There is no
+    deadline of its own -- the retry ladder underneath is bounded by
+    construction, and `task_timeout_seconds` is the backstop over the page task.
     """
-    monkeypatch.setattr(worker.settings, "outlink_publish_timeout_seconds", 0.1)
-
-    async def hang(*args, **kwargs):
-        await asyncio.sleep(60)
-
     parent = UmbraMessage(json.loads(message_maker("https://example.com").body))
-    with patch.object(worker, "publish_umbra_response", AsyncMock(side_effect=hang)):
-        published = await asyncio.wait_for(
-            worker.publish_outlinks(
-                MagicMock(spec=AsyncMessageClient), parent, {"https://example.com/x"}
-            ),
-            timeout=5,
+    with patch.object(
+        worker, "publish_umbra_response", AsyncMock(side_effect=RuntimeError("broker"))
+    ):
+        published = await worker.publish_outlinks(
+            MagicMock(spec=AsyncMessageClient), parent, {"https://example.com/x"}
         )
     assert published is False
+
+
+def test_outlink_publish_bound_tracks_the_retry_ladder():
+    """
+    `task_timeout_seconds` contains the publish, so its estimate of how long a
+    publish can take has to follow the retry settings rather than a hardcoded
+    guess -- raising `publish_max_attempts` used to leave the backstop below the
+    ladder it was supposed to contain.
+    """
+    settings = worker.Settings(
+        publish_max_attempts=3,
+        publish_timeout_seconds=30.0,
+        publish_retry_base_delay_seconds=0.5,
+    )
+    # 3 attempts x 30s, plus sleeps of 0.5s and 1.0s between them.
+    assert settings.outlink_publish_bound_seconds == 91.5
+    assert settings.task_timeout_seconds > settings.outlink_publish_bound_seconds
+
+    patient = worker.Settings(publish_max_attempts=5)
+    assert patient.outlink_publish_bound_seconds > (
+        settings.outlink_publish_bound_seconds
+    )
+    assert patient.task_timeout_seconds > patient.outlink_publish_bound_seconds
 
 
 @pytest.mark.asyncio
@@ -971,44 +1011,40 @@ async def test_robust_context_close_bounds_a_hanging_close(monkeypatch):
     await asyncio.wait_for(worker.robust_context_close(context), timeout=5)
 
 
-def test_stalled_page_slots_ignores_tasks_inside_their_backstop(monkeypatch):
-    """A page that is merely slow is not stuck; its own `wait_for` still owns it."""
-    monkeypatch.setitem(worker.settings.__dict__, "page_task_stall_seconds", 100.0)
-    now = monotonic()
-
-    assert worker.stalled_page_slots({}) == []
-    assert worker.stalled_page_slots({MagicMock(): now}) == []
-    assert worker.stalled_page_slots({MagicMock(): now - 99}) == []
-
-
-def test_stalled_page_slots_reports_each_stuck_slot_oldest_first(monkeypatch):
+def test_task_timeout_contains_every_deadline_it_wraps():
     """
-    Every slot is aged independently, and this is the regression that matters: the
-    previous check compared one instance-wide "last completion" against now, so a
-    single healthy slot refreshed it and hid every stuck one behind it. Nine leaked
-    permits and one working page looked perfectly healthy.
-    """
-    monkeypatch.setitem(worker.settings.__dict__, "page_task_stall_seconds", 100.0)
-    now = monotonic()
-
-    stalled = worker.stalled_page_slots(
-        {
-            MagicMock(): now - 500,  # stuck, oldest
-            MagicMock(): now - 200,  # stuck
-            MagicMock(): now,  # healthy, and must not mask the others
-        }
-    )
-
-    assert len(stalled) == 2
-    assert stalled[0] > stalled[1]
-    assert 499 < stalled[0] < 501
-
-
-def test_page_task_stall_threshold_sits_above_the_backstop_it_checks():
-    """
-    Derived rather than configured, so it cannot be set below the deadline that
-    should already have freed the slot -- which would make every slow page a false
-    positive and restart a working instance.
+    The backstop in `run_page_task` has to sit above the sum of the phases it
+    contains, or a page that legitimately uses its whole budget is killed by the
+    thing meant to catch a hung one.
     """
     settings = worker.Settings()
-    assert settings.page_task_stall_seconds > settings.task_timeout_seconds
+    assert settings.task_timeout_seconds > (
+        settings.browser_deadline_seconds
+        + settings.outlink_publish_bound_seconds
+        + settings.context_close_timeout_seconds
+        + settings.amqp_ack_timeout_seconds
+    )
+
+
+@pytest.mark.asyncio
+async def test_over_release_is_reported_but_does_not_raise(caplog):
+    """
+    Releasing a permit that was never acquired means the slot accounting is
+    wrong, and every acquire on the page path is matched 1:1 -- so this should be
+    unreachable. It still must not raise: the only release on that path is in
+    `run_page_task`'s `finally`, where an exception would lose the permit for
+    good and take the page task's error handling with it.
+    """
+    semaphore = worker.SilentBoundedSemaphore(1)
+
+    with caplog.at_level(logging.ERROR, logger="penumbra.worker"):
+        semaphore.release()
+
+    assert "Semaphore over-released" in caplog.text
+    # The traceback is the point: it names the release that was one too many.
+    assert "Stack (most recent call last)" in caplog.text
+
+    # The bound still holds: BoundedSemaphore checks before incrementing, so the
+    # rejected release handed out no extra permit. One acquire still exhausts it.
+    await asyncio.wait_for(semaphore.acquire(), timeout=1)
+    assert semaphore.locked()

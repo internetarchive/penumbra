@@ -9,7 +9,7 @@ from prometheus_client import REGISTRY
 
 from penumbra import metrics
 from penumbra.models import UmbraMessage, UmbraResponse
-from penumbra.queues import AsyncMessageClient
+from penumbra.queues import AsyncMessageClient, TopologyUnusable
 
 # Outer guard on the bounded-publish tests, so a regression hangs the test rather
 # than the suite. It has to stay well above `publish_timeout` and well below the
@@ -279,45 +279,51 @@ async def test_publish_timeout_covers_the_connect_as_well_as_the_publish():
 
 
 @pytest.mark.asyncio
-async def test_connect_rebuilds_when_a_channel_dies_under_a_live_connection():
+async def test_connect_refuses_to_replace_the_connection_under_a_consumer():
     """
-    The failure this guard exists for. The broker closed both channels while the
-    connection stayed up, so `connection.is_closed` was False and the old check
-    handed the dead exchange to every publish and the dead queue to every ack for
-    the life of the process -- with the gauge still reading 1 throughout, because
-    it only ever moved on connection-close callbacks.
+    The broker closed both channels while the connection stayed up, so
+    `connection.is_closed` is False and aio-pika's in-place restore did not fire.
+    Replacing the connection here looks like the fix and is not: the consume
+    loop's iterator holds the `queue` object it was created from, so a
+    replacement leaves this instance iterating a dead channel while `is_usable`
+    reports the new topology as healthy and the watchdog resets its timer.
+
+    So `connect` fails the caller instead, leaves the dead topology in place for
+    `is_usable` to keep reporting, and lets `watch_broker` exit the process.
     """
-    first, second = connection_mock(), connection_mock()
-    connect_robust = AsyncMock(side_effect=[first, second])
+    connection = connection_mock()
+    connect_robust = AsyncMock(return_value=connection)
     client = AsyncMessageClient(recovery_timeout=0.05)
     metrics.penumbra_broker_connected.set(0)
 
     with patch("aio_pika.connect_robust", connect_robust):
         await client.connect()
-        assert client.connection is first
+        assert client.connection is connection
 
         # The broker closes the channels and aio-pika never brings them back. The
         # connection itself is untouched, which is the whole difficulty.
-        for channel in first.declared_channels:
+        for channel in connection.declared_channels:
             channel.is_closed = True
 
-        queue, exchange = await client.connect()
+        with pytest.raises(TopologyUnusable):
+            await client.connect()
 
-    assert connect_robust.await_count == 2
-    assert client.connection is second
-    assert queue is client.queue and exchange is client.exchange
-    assert REGISTRY.get_sample_value("penumbra_broker_connected") == 1
-    # The connection we gave up on is closed rather than dropped: a
-    # RobustConnection owns a reconnect task that outlives every reference to it.
-    first.close.assert_awaited_once()
+    # No replacement connection, and the dead one is neither closed nor swapped:
+    # `is_usable` has to go on reporting it so the watchdog can act.
+    assert connect_robust.await_count == 1
+    assert client.connection is connection
+    connection.close.assert_not_awaited()
+    assert not client.is_usable()
+    # The gauge is what distinguishes "up but not consuming" from an idle queue.
+    assert REGISTRY.get_sample_value("penumbra_broker_connected") == 0
 
 
 @pytest.mark.asyncio
-async def test_connect_lets_aio_pika_restore_a_channel_before_rebuilding():
+async def test_connect_lets_aio_pika_restore_a_channel_in_place():
     """
-    A RobustChannel reopens itself after the broker closes it, so a transient close
-    must not cost a new connection: rebuilding on every one would churn connections
-    and race the library's own recovery, which usually works.
+    A RobustChannel reopens itself after the broker closes it, and it reopens the
+    same channel object -- which is why this recovery is safe for a live consumer
+    and replacing the connection is not. The common transient close still heals.
     """
     connection = connection_mock()
     connect_robust = AsyncMock(return_value=connection)
@@ -352,26 +358,59 @@ async def test_publish_recovers_after_the_broker_closes_the_publish_channel():
     channel used to fail forever, because `connect` handed the same dead exchange
     back on every attempt. All three tries in `publish_with_retry` failed inside a
     second and the URL was dropped -- for every URL, indefinitely.
+
+    The recovery is aio-pika's own, in place on the same channel object.
     """
-    first, second = connection_mock(), connection_mock()
+    connection = connection_mock()
+    client = AsyncMessageClient(recovery_timeout=5.0)
+    response = MagicMock(client_id="urls")
+    response.asdict.return_value = {"url": "https://example.com"}
+
+    with patch("aio_pika.connect_robust", AsyncMock(return_value=connection)):
+        await client.connect()
+        exchange = client.exchange
+        channels = list(connection.declared_channels)
+
+        async def restore():
+            for channel in channels:
+                channel.is_closed = False
+
+        for channel in channels:
+            channel.is_closed = True
+            channel.ready = AsyncMock(side_effect=restore)
+
+        await client.publish_message(response)
+
+    # Same connection, same exchange -- reopened rather than replaced.
+    assert client.connection is connection
+    assert client.exchange is exchange
+    exchange.publish.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_publish_fails_and_is_counted_when_the_topology_cannot_recover():
+    """
+    A publish is the only caller that can hit an unrecoverable topology, and it
+    must fail rather than hang or silently succeed: `publish_with_retry` turns
+    that into a counted drop, which is the last honest thing this process can do
+    with the URL before the watchdog restarts it.
+    """
+    connection = connection_mock()
     client = AsyncMessageClient(recovery_timeout=0.05)
     response = MagicMock(client_id="urls")
     response.asdict.return_value = {"url": "https://example.com"}
 
-    with patch("aio_pika.connect_robust", AsyncMock(side_effect=[first, second])):
+    with patch("aio_pika.connect_robust", AsyncMock(return_value=connection)):
         await client.connect()
-        dead_exchange = client.exchange
-        for channel in first.declared_channels:
+        exchange = client.exchange
+        for channel in connection.declared_channels:
             channel.is_closed = True
 
-        await client.publish_message(response)
+        with pytest.raises(TopologyUnusable):
+            await client.publish_message(response)
 
-    # It went out on the rebuilt exchange, not the dead one.
-    assert client.connection is second
-    assert client.exchange is not dead_exchange
-    client.exchange.publish.assert_awaited_once()
-    dead_exchange.publish.assert_not_awaited()
-    assert REGISTRY.get_sample_value("penumbra_amqp_topology_rebuilds_total") >= 1
+    # Nothing was handed to the dead exchange.
+    exchange.publish.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -453,7 +492,9 @@ async def test_publish_body_preserves_present_source():
     (message,), _ = client.exchange.publish.call_args
     body = json.loads(message.body)
 
-    assert body["parentUrlMetadata"]["heritableData"]["source"] == "https://example.com/"
+    assert (
+        body["parentUrlMetadata"]["heritableData"]["source"] == "https://example.com/"
+    )
 
 
 @pytest.mark.asyncio
