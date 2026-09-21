@@ -6,8 +6,6 @@ import signal
 from contextlib import suppress
 from itertools import cycle
 
-# `time` below is prometheus_async's decorator, not the stdlib module, so import
-# the clock we need by name.
 from time import monotonic
 from urllib.parse import urlsplit, urlunsplit
 
@@ -36,20 +34,7 @@ class SilentBoundedSemaphore(asyncio.BoundedSemaphore):
     Swallow the ValueError `BoundedSemaphore` raises when a release would push the
     counter above the bound, but say so.
 
-    Note what swallowing does and does not buy. The parent checks the bound
-    *before* incrementing, so the extra permit is never handed out either way --
-    an over-release is rejected, not applied, and concurrency cannot exceed the
-    bound. All this avoids is the exception reaching the caller, which matters
-    because the only release on the page path is in `run_page_task`'s `finally`:
-    raising there would skip the rest of that handler and lose the permit for
-    the life of the process.
-
-    It is not an expected event. Every acquire is matched by exactly one
-    release: the consume loop's own on the two paths that start no page task,
-    and `run_page_task`'s `finally` otherwise, which runs even when the task is
-    cancelled during the shutdown drain. So reaching this handler means the
-    accounting is wrong somewhere -- hence the traceback, which names the
-    release that was one too many.
+    Not an expected event, but better to log than lose a slot in the worker pool
     """
 
     def release(self):
@@ -71,8 +56,8 @@ async def publish_with_retry(
 
     Never raises: a single unpublishable URL must not cancel its sibling
     publishes via the enclosing `TaskGroup`, nor fail the whole page. Once the
-    attempts are exhausted the URL is dropped loudly -- that link is lost, so it
-    is an error, not a warning. Returns True if the response was published.
+    attempts are exhausted the URL is dropped loudly.
+    Returns True if the response was published.
     """
     delay = settings.publish_retry_base_delay_seconds
     for attempt in range(1, settings.publish_max_attempts + 1):
@@ -116,20 +101,11 @@ async def publish_umbra_response(
     The number of links found in page processing is *unbounded*.
     There doesn't appear to be a batch publish method for RabbitMQ.
     To save time, `publish_umbra_response` publishes each response asynchronously.
-
-    Reported once per page rather than once per URL. The count is unbounded, so
-    a line each made the publish path the bulk of the log on any link-heavy
-    crawl -- and said nothing `penumbra_urls_found` was not already counting.
-    What a line cannot tell you from the outside is how many of them failed,
-    which is what the summary is for.
     """
     async with asyncio.TaskGroup() as tg:
         publishes = []
         for url in urls:
             if len(url) > settings.max_url_length:
-                # Still per-URL: over-length ones are rare, and which URL it was
-                # is the only useful thing to say about them. Truncated, because
-                # they are over-length by definition.
                 logger.info(
                     "Dropping over-length URL (%d chars): %.200s...", len(url), url
                 )
@@ -145,8 +121,7 @@ async def publish_umbra_response(
 
     if not publishes:
         return
-    # Safe to read: the TaskGroup has exited, so every task is done, and
-    # `publish_with_retry` reports its outcome rather than raising it.
+
     published = sum(task.result() for task in publishes)
     if published == len(publishes):
         logger.info("Published %d links from %s", published, parent_message.url)
@@ -167,10 +142,6 @@ def canonical_url(url: str) -> str:
     Chromium asks for a normalised form of what it was given: a bare host gains
     a trailing slash, the host is lowercased, and the fragment is never sent. So
     comparing raw strings misses the very URL we are trying to match.
-
-    Deliberately minimal, and only ever used for that one comparison. Path and
-    query keep their case because they are case-sensitive, and the only URLs
-    this can conflate are ones that address the same resource anyway.
     """
     parts = urlsplit(url)
     return urlunsplit(
@@ -180,11 +151,7 @@ def canonical_url(url: str) -> str:
 
 def outlinks_from(page_requests: set[str], page_url: str) -> set[str]:
     """
-    The links a page discovered: everything it requested except itself.
-
-    Its own URL is always in there, and Heritrix is where it came from --
-    returning it is a no-op the frontier has to dedupe away. Anything it
-    redirected through on the way is a real discovery and stays.
+    The links discovered on a page: everything it requested except itself.
     """
     page = canonical_url(page_url)
     return {url for url in page_requests if canonical_url(url) != page}
@@ -196,10 +163,7 @@ def update_metrics(urls: set[str]) -> None:
 
     Called for every message we take off the queue and attempt, however it went.
     A site that was offline, served a bad certificate or timed out is still a
-    page that was crawled -- that result is the state of the site at archive
-    time, not a non-event. `penumbra_pages_failed` is where the breakdown lives;
-    counting only the pages that loaded would make this a measure of the web's
-    health rather than of penumbra's throughput.
+    page that was crawled.
     """
     metrics.penumbra_last_page_crawled_time.set_to_current_time()
     metrics.penumbra_pages_crawled.inc(1)
@@ -212,16 +176,12 @@ async def watch_broker(client: AsyncMessageClient) -> str | None:
 
     Returns why it gave up, or None if it was stopped by an ordinary shutdown.
 
-    Deliberately slow to fire: a broker restart or a brief partition resolves
-    well inside `broker_unhealthy_exit_seconds`, and the cost of a false
-    positive is restarting a working instance.
+    A broker restart or a brief partition should resolve well inside
+    `broker_unhealthy_exit_seconds`, and the cost of a false positive is
+    restarting a working instance.
 
     Page tasks are not watched here. Each one is already bounded by
-    `task_timeout_seconds` in `run_page_task`, and the only way that `wait_for`
-    fails to fire is a blocked event loop -- which would stop this coroutine
-    from running too, so a watchdog on the same loop cannot be the answer to it.
-    `penumbra_page_task_deadline_exceeded` is the signal for a backstop that had
-    to step in.
+    `task_timeout_seconds` in `run_page_task`.
     """
     unhealthy_since: float | None = None
     while True:
@@ -289,13 +249,7 @@ async def robust_context_close(context) -> None:
 NET_ERROR_PATTERN = re.compile(r"net::(ERR_[A-Z0-9_]+)")
 
 # Playwright failures that carry no `net::` code, matched as lowercase fragments
-# of the message because that is the only place Playwright reports them:
-# `type(e).__name__` is the bare string "Error" for all of them, which made every
-# one of these collapse into a single useless metric series.
-#
-# The slug keeps `penumbra_pages_failed` bounded and readable. It cannot be the
-# raw message -- some of these embed URLs ("Navigation to X is interrupted by
-# another navigation to Y"), which would give the label unbounded cardinality.
+# of the message because that is the only place Playwright reports them.
 PLAYWRIGHT_ERRORS: tuple[tuple[str, str], ...] = (
     # fragment, metric slug
     ("download is starting", "download_started"),
@@ -308,6 +262,7 @@ PLAYWRIGHT_ERRORS: tuple[tuple[str, str], ...] = (
     ("protocol error", "protocol_error"),
 )
 UNKNOWN_PLAYWRIGHT_ERROR = "playwright_error"
+BROWSER_STUCK_ERROR = "browser_stuck"
 
 
 def classify_playwright_message(text: str) -> str:
@@ -322,23 +277,12 @@ def classify_playwright_message(text: str) -> str:
 class PageLoadTimeout(Exception):
     """
     The document committed but its subresources never finished.
-
-    Both crawl phases raise Playwright's `TimeoutError`, so the second one is
-    re-raised as this to keep them apart. Carrying the phase in the exception
-    type rather than in a variable keeps `failure_reason` a function of the
-    exception alone.
     """
 
 
 def failure_reason(e: Exception, deadline_expired: bool) -> str:
     """
     Name a page failure, for `penumbra_pages_failed` and the log.
-
-    Doubles as the metric label, so the result stays a bounded set: a net error
-    code, a Playwright slug from `PLAYWRIGHT_ERRORS`, or an exception class
-    name. However a page failed, the links it did find are published and the
-    message is settled -- a page is only ever attempted once -- so this decides
-    what the failure is called and nothing else.
     """
     # Phase 2: committed, but the subresources never finished. Spending the
     # whole budget on a page is a result, not a failure.
@@ -355,13 +299,12 @@ def failure_reason(e: Exception, deadline_expired: bool) -> str:
         # Everything else Playwright reports only in the message text.
         return classify_playwright_message(str(e))
     # The outer backstop. Both phases are bounded on their own, so reaching this
-    # means one of the untimed protocol calls hung -- a wedged browser, not a
-    # slow site.
+    # means a wedged browser, not a slow site.
     #
     # Only the deadline actually expiring counts: the builtin TimeoutError is an
     # OSError subclass that aio-pika also raises from a socket operation.
     if isinstance(e, TimeoutError) and deadline_expired:
-        return "browser_stuck"
+        return BROWSER_STUCK_ERROR
     # Nothing recognised it. The exception's class name is the most specific
     # label available, and `log_page_failure` keys the traceback off it.
     return type(e).__name__
@@ -372,15 +315,6 @@ async def publish_outlinks(
 ) -> bool:
     """
     Return a page's links to Heritrix. Returns True if they all went out.
-
-    Carries no deadline of its own. Every publish underneath is already bounded
-    by `publish_timeout_seconds` with `publish_max_attempts` tries, so the path
-    is bounded by construction, and `task_timeout_seconds` is the backstop over
-    the whole page task. A deadline here would be a third bound on the same
-    work, and the one that fired first: it cancelled the `TaskGroup`, whose
-    `CancelledError` passes straight through `publish_with_retry`'s
-    `except Exception` -- so every pending URL was dropped without
-    `penumbra_urls_dropped_publish_failed` counting any of them.
 
     Never raises: failing to deliver the links must still let the message be
     settled and the slot freed, and `publish_with_retry` has already counted
@@ -404,16 +338,8 @@ def log_page_failure(
 ) -> None:
     """
     Report a page that did not load cleanly, at a level matching how bad it is.
-
-    The two warnings come first: a wedged browser and a failure nobody
-    recognised are about this process, and neither may be talked down to an
-    info line just because the page happened to fire a request on its way out.
     """
-    if reason == "browser_stuck":
-        # Both crawl phases are bounded on their own, so the outer deadline
-        # firing means an untimed protocol call hung. This line and
-        # penumbra_pages_failed{reason="browser_stuck"} are the only signs the
-        # pool has gone bad.
+    if reason == BROWSER_STUCK_ERROR:
         logger.warning(
             "Browser deadline expired on %s before the crawl phases could even "
             "run; giving up on it. That is the browser rather than the site.",
@@ -433,9 +359,6 @@ def log_page_failure(
             len(outlinks),
         )
     else:
-        # A reason from the catalogue describes the failure completely, so no
-        # traceback: these are numerous enough that stack traces would bury
-        # everything else. The per-reason counter is what to watch, not the log.
         logger.info("Unreachable page (%s): %s", reason, message.url)
 
 
@@ -495,26 +418,14 @@ async def process_page(
 
     The crawl runs in two phases, each with its own timeout: navigate until the
     server answers and the document commits, then wait for its subresources to
-    finish. Sequential rather than nested, so the two budgets are independent
-    and the worst case is their sum. Splitting them also separates "we could not
-    reach this at all" from "it never finished rendering", which a single
-    timeout around both cannot tell apart.
+    finish. Splitting them separates an unreachable site from a site that never
+    finishes loading.
 
     The browser deadline wraps both as a backstop, because `new_context`,
     `new_page` and `route` are untimed Playwright protocol calls that block
-    forever against a wedged browser -- which is how a task, and one of only
-    `browser_pool_size * contexts_per_browser` semaphore permits, gets stuck for
-    the life of the process.
+    forever against a wedged browser.
 
-    Publishing and settling the message happen afterwards, once, on the same
-    path whether or not the page loaded: a page that ran out of time or died at
-    connect still fired real requests -- redirect hops included -- and those
-    links are worth exactly as much as any others.
-    Keeping them outside the page deadline also means a slow broker is charged
-    to the broker rather than misreported as a slow page, and that the ack
-    cannot be interrupted part-way -- an interrupted `ack()` leaves the
-    Basic.Ack frame on the wire with the message still marked unprocessed, and
-    the page is crawled again on redelivery for nothing.
+    Publishing and settling the message happen afterward on a separate deadline.
     """
     message = UmbraMessage(json.loads(raw_message.body))
     context = None
@@ -567,9 +478,6 @@ async def process_page(
 
     await robust_ack(raw_message, message.url)
 
-    # Unconditional, and last: we took this message off the queue and are done
-    # with it. Whether the page loaded, timed out or was never reachable, the
-    # attempt is the unit being counted.
     update_metrics(outlinks)
 
 
@@ -603,11 +511,8 @@ def report_watchdog_death(task: asyncio.Task) -> None:
     """
     Bring the process down if the watchdog itself dies.
 
-    `main` only reads the watchdog's outcome after the consume loop has stopped,
-    and the watchdog is what stops it. So a watchdog that raises is silent: the
-    loop goes on consuming with nothing left watching for a stall, which is the
-    state this whole watchdog exists to make impossible. Setting the event ends
-    the loop, and `main` re-raises the exception from `result()` on the way out.
+    Setting the event ends the loop, and `main` re-raises the exception from
+    `result()` on the way out.
     """
     if task.cancelled():
         return
@@ -635,9 +540,7 @@ async def or_shutdown(awaitable):
         await asyncio.wait((task, waiter), return_when=asyncio.FIRST_COMPLETED)
         # The event is asked directly rather than `waiter.done()`, which is also
         # true when the wait itself failed -- and would then report a shutdown
-        # nobody requested. Shutdown wins a tie: a delivery that landed in the
-        # same moment is left unacked for redelivery, rather than started with no
-        # time left to finish it.
+        # nobody requested.
         if shutdown_event.is_set():
             return SHUTDOWN
         if task.done():
@@ -712,9 +615,7 @@ async def main():
 
         The `wait_for` is a backstop around the deadlines inside `process_page`:
         if any await there ever escapes its own timeout, this still frees the
-        permit instead of leaking it. Leaking `max_concurrency` permits stops
-        this instance consuming entirely, without exiting -- so systemd sees a
-        healthy unit and `Restart=always` never fires.
+        permit instead of leaking it.
         """
         try:
             await asyncio.wait_for(
@@ -742,9 +643,6 @@ async def main():
 
         shutdown_event.set()
 
-    # `add_signal_handler`, not `signal.signal`: a plain handler sets the event
-    # without waking the selector, leaving an idle loop parked until its next
-    # timer fires.
     loop = asyncio.get_running_loop()
     for signal_number in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(signal_number, shutdown_signal_handler)
@@ -783,11 +681,7 @@ async def main():
                 task.add_done_callback(done_callback)
                 page_tasks.add(task)
 
-        # Wait for in-progress tasks before shutdown, but only for so long. A page
-        # task's own backstop is `task_timeout_seconds`, which is longer than
-        # systemd's default TimeoutStopSec -- so draining without a bound would
-        # just move the SIGKILL from the idle case to the busy one. Anything
-        # abandoned here was never acked, so the broker redelivers it.
+        # Wait for in-progress tasks before shutdown, but only for so long.
         draining = set(page_tasks)
         if draining:
             logger.info(
@@ -809,22 +703,15 @@ async def main():
                     _abandon(task)
 
         # Raised here rather than from the watchdog itself, so the in-flight pages
-        # still get their chance to finish and ack first. Non-zero exit is the
-        # point: `Restart=always` brings us back, and the unit shows a failure
-        # instead of a process that is up and quietly consuming nothing.
+        # still get their chance to finish and ack first.
         if watchdog_task.done() and not watchdog_task.cancelled():
             if reason := watchdog_task.result():
                 raise InstanceStalled(reason)
 
     except asyncio.CancelledError:
         pass
-    # Two arrivals, not one: the initial connect never reached a usable broker,
-    # or the consume loop's iterator failed under us mid-run -- the broker
-    # closing the consume channel surfaces as an exception from `anext` rather
-    # than as the end of the iteration. Both mean this instance is not
-    # consuming, and neither is something it can put right itself. Exit non-zero
-    # and let the supervisor retry with backoff. The exception carries which one
-    # it was; guessing in the message only ever named the wrong timeout.
+    # Either the initial connect never reached a usable broker, or the broker
+    # closed the consume channel. Exit non-zero.
     except (TimeoutError, aio_pika.exceptions.AMQPError) as e:
         logger.error(
             "AMQP failure on queue %s, so this instance is not consuming. "

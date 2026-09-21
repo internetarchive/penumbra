@@ -9,23 +9,13 @@ from penumbra import metrics, models
 
 logger = logging.getLogger(__name__)
 
-# Bound on closing a connection whose setup did not finish. Not configurable: it
-# only runs on an error path, where the alternative is hanging on `_connect_lock`
-# and blocking every other publisher behind it.
+# Bound on closing a connection whose setup did not finish.
 DISCARD_CLOSE_TIMEOUT = 10.0
 
 
 class TopologyUnusable(Exception):
     """
     The cached topology is dead and this process cannot replace it.
-
-    Raised instead of rebuilding, because the consume loop's message iterator
-    holds the `queue` object it was created from: swapping the connection out
-    from under it would leave this instance consuming a channel that no longer
-    exists while `is_usable` reported the replacement as healthy. Publishes fail
-    on this and are counted; if the topology does not recover, `watch_broker`
-    exits the process and the supervisor brings back an instance whose consumer
-    and topology agree.
     """
 
 
@@ -74,15 +64,10 @@ class AsyncMessageClient:
         """
         True when the cached topology can actually carry a message.
 
-        `connection.is_closed` is not enough, on two counts. A
+        `connection.is_closed` is not enough.
         `RobustConnection` reports `is_closed == False` for the entire time it is
         retrying a dropped connection, and a channel can be closed by the broker
-        -- a `consumer_timeout`, or a `PRECONDITION_FAILED` from an ack that
-        arrived late -- while the connection stays up and healthy. Either way the
-        cached `queue` and `exchange` are dead objects, and a guard that only
-        looks at the connection hands them back for the life of the process:
-        every publish then fails with `ChannelInvalidStateError` and every ack
-        with it, while the process stays up and looks fine.
+        while the connection stays up and healthy.
         """
         if self.connection is None or self.connection.is_closed:
             return False
@@ -99,14 +84,7 @@ class AsyncMessageClient:
 
         A `RobustChannel` reopens itself after the broker closes it, and a
         `RobustConnection` re-declares the whole topology after reconnecting, so
-        the usual answer to a dead channel is simply to wait a moment. Tearing
-        the connection down on every transient close would churn connections and
-        race the library's own recovery.
-
-        Bounded because that recovery is not guaranteed. `RobustChannel._on_close`
-        skips the restore entirely if a previous restore left it part-way
-        (`__restored` cleared), and nothing clears that state again on its own --
-        so the wait has to end in a verdict rather than in more waiting.
+        the usual answer to a dead channel is simply to wait a moment.
         """
         try:
             async with asyncio.timeout(self.recovery_timeout):
@@ -152,8 +130,7 @@ class AsyncMessageClient:
             consume_channel = await connection.channel()
             # Without an explicit QoS, RabbitMQ pushes the entire queue at
             # this consumer and aio-pika buffers it in an unbounded
-            # asyncio.Queue: unbounded memory, and a `purge` leaves the
-            # already-delivered backlog to be worked through anyway.
+            # asyncio.Queue.
             await consume_channel.set_qos(prefetch_count=self.prefetch_count)
             queue = await consume_channel.declare_queue(self.queue_name, durable=True)
 
@@ -255,10 +232,6 @@ class AsyncMessageClient:
     async def _discard(connection) -> None:
         """
         Close a connection whose setup did not finish, so it is not leaked.
-
-        Bounded and never raises: the reason setup failed is often that the broker
-        is unreachable, and this runs while still holding `_connect_lock` on the
-        way out of an already-failing `connect`.
         """
         try:
             async with asyncio.timeout(DISCARD_CLOSE_TIMEOUT):
@@ -294,14 +267,6 @@ class AsyncMessageClient:
             # Get the cached connection, opening one if this is the first publish
             # or the last connection dropped.
             queue, exchange = await self.connect()
-            # `json.dumps`, not `str`. Heritrix parses these with org.json, whose
-            # tokeniser is lenient enough to accept a Python dict repr, however,
-            # it does not accept `None`: it special-cases only
-            # true/false/null, so a bare `None` falls through to being read as the
-            # *string* "None", and AMQPUrlReceiver.populateHeritableMetadata then
-            # tags the URL with a source of "None" rather than leaving it unset.
-            # Strict JSON is a subset of what that parser accepts, so this stays
-            # compatible while fixing the null case and the escaping with it.
             await exchange.publish(
                 aio_pika.Message(
                     body=json.dumps(umbra_response.asdict()).encode(),

@@ -17,30 +17,16 @@ class Settings(BaseSettings):
     amqp_routing_key: str = Field(default="urls")
     amqp_exchange_name: str = Field(default="umbra")
     amqp_connect_timeout_seconds: float = Field(default=60.0, gt=0)
-    # How long to let aio-pika restore a channel the broker closed before giving
-    # up on the publish. A robust channel normally reopens itself, so this is a
-    # grace period rather than a limit -- but the recovery is not guaranteed, and
-    # without an end to the waiting a dead channel under a live connection stops
-    # the instance consuming for the life of the process. Failing is the whole
-    # fallback: the connection is never replaced under a live consumer, so a
-    # topology that does not recover is `watch_broker`'s problem, not `connect`'s.
-    # Kept below `publish_timeout_seconds`, which encloses it on the publish path.
+    # How long to let aio-pika attempt to restore a channel the broker closed
     amqp_recovery_timeout_seconds: float = Field(default=10.0, gt=0)
-    # Grace period for in-progress page tasks at shutdown. Deliberately well under
-    # systemd's default TimeoutStopSec (90s): a page task's own backstop is
-    # `task_timeout_seconds`, so an unbounded drain would earn a SIGKILL whenever
-    # pages are in flight. Abandoned tasks were never acked, so their messages are
-    # redelivered.
+    # Grace period for in-progress page tasks at shutdown.
     shutdown_drain_timeout_seconds: float = Field(default=30.0, gt=0)
     # How often the watchdog checks that this instance is still making progress.
     watchdog_interval_seconds: float = Field(default=30.0, gt=0)
     # How long the AMQP topology may stay unusable before the process gives up and
     # exits for the supervisor to restart it. Comfortably longer than
     # `amqp_recovery_timeout_seconds` and than a broker restart, so an outage that
-    # resolves itself never costs a restart -- but far short of the ten hours the
-    # August outages spent sitting idle. This is the only thing that recovers a
-    # topology aio-pika could not restore in place, since `connect` will not
-    # replace the connection under a live consumer. See `watch_broker`.
+    # resolves itself never costs a restart.
     broker_unhealthy_exit_seconds: float = Field(default=300.0, gt=0)
     # Heritrix rejects URLs longer than its UURI limit (2083 chars), so drop
     # over-length URLs before enqueueing rather than publishing dead links.
@@ -89,8 +75,7 @@ class Settings(BaseSettings):
         Both crawl phases carry their own timeout, so reaching this means one of
         the *untimed* Playwright protocol calls -- `new_context`, `new_page`,
         `route` -- hung against a wedged browser. Derived rather than configured
-        precisely so it cannot be set below the phases it contains: that was the
-        one way the two page timeouts used to be able to cancel each other out.
+        precisely so it cannot be set below the phases it contains.
         The margin covers those setup calls.
         """
         return self.navigation_timeout_seconds + self.page_timeout_seconds + 30.0
@@ -100,13 +85,6 @@ class Settings(BaseSettings):
     def outlink_publish_bound_seconds(self) -> float:
         """
         How long returning one page's links can take, at worst.
-
-        Not a deadline -- nothing enforces this. It is the natural bound of the
-        retry ladder in `publish_with_retry`: every attempt is capped by
-        `publish_timeout_seconds` and the sleeps between them double from
-        `publish_retry_base_delay_seconds`. Publishes run concurrently, so the
-        page pays this once rather than once per URL. Exists so that
-        `task_timeout_seconds` tracks the ladder instead of a hardcoded guess.
         """
         backoff = self.publish_retry_base_delay_seconds * (
             2 ** (self.publish_max_attempts - 1) - 1
@@ -162,16 +140,7 @@ class HeritableData:
         return f"source:{self.source} heritable:{self.heritable}"
 
     def asdict(self) -> dict:
-        # Omit an absent source rather than emitting `"source": null`. Heritrix
-        # parses these with org.json, which maps a JSON null to the
-        # `JSONObject.NULL` sentinel rather than to Java null, and
-        # AMQPUrlReceiver.populateHeritableMetadata copies every key of
-        # heritableData into the CrawlURI's data map without an isNull() check.
-        # The sentinel then satisfies the `containsDataKey` guard on every
-        # consumer of the source tag -- the crawl log, the stats tracker, the
-        # WARC writer -- each of which casts the value straight to String, so
-        # the URL takes a ClassCastException instead of going untagged.
-        # Leaving the key out is what "unset" means to that code.
+        # Omit an absent source rather than emitting `"source": null`.
         data = asdict(self)
         if self.source is None:
             del data["source"]
