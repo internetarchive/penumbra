@@ -16,6 +16,31 @@ class Settings(BaseSettings):
     amqp_queue_name: str = Field(default="urls")
     amqp_routing_key: str = Field(default="urls")
     amqp_exchange_name: str = Field(default="umbra")
+    amqp_connect_timeout_seconds: float = Field(default=60.0, gt=0)
+    # How long to let aio-pika attempt to restore a channel the broker closed
+    amqp_recovery_timeout_seconds: float = Field(default=10.0, gt=0)
+    # Grace period for in-progress page tasks at shutdown.
+    shutdown_drain_timeout_seconds: float = Field(default=30.0, gt=0)
+    # How often the watchdog checks that this instance is still making progress.
+    watchdog_interval_seconds: float = Field(default=30.0, gt=0)
+    # How long the AMQP topology may stay unusable before the process gives up and
+    # exits for the supervisor to restart it. Comfortably longer than
+    # `amqp_recovery_timeout_seconds` and than a broker restart, so an outage that
+    # resolves itself never costs a restart.
+    broker_unhealthy_exit_seconds: float = Field(default=300.0, gt=0)
+    # Heritrix rejects URLs longer than its UURI limit (2083 chars), so drop
+    # over-length URLs before enqueueing rather than publishing dead links.
+    max_url_length: int = Field(default=2083, ge=1)
+    # Time to wait for a server to respond to the initial request
+    navigation_timeout_seconds: float = Field(default=30.0, gt=0)
+    # Time to wait for a page to be considered finished requestion resources. After this,
+    # outlinks a send regardless of current page status
+    page_timeout_seconds: float = Field(default=120.0, gt=0)
+    context_close_timeout_seconds: float = Field(default=30.0, gt=0)
+    amqp_ack_timeout_seconds: float = Field(default=30.0, gt=0)
+    publish_timeout_seconds: float = Field(default=30.0, gt=0)
+    publish_max_attempts: int = Field(default=3, ge=1)
+    publish_retry_base_delay_seconds: float = Field(default=0.5, gt=0)
     install_playwright: bool = Field(default=True)
     skip_resource_document: bool = Field(default=False)
     skip_resource_stylesheet: bool = Field(default=False)
@@ -34,6 +59,53 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", env_prefix="penumbra_"
     )
+
+    @computed_field
+    @cached_property
+    def max_concurrency(self) -> int:
+        """Concurrent page tasks, and therefore the AMQP prefetch count."""
+        return self.browser_pool_size * self.contexts_per_browser
+
+    @computed_field
+    @cached_property
+    def browser_deadline_seconds(self) -> float:
+        """
+        Backstop over the whole browser interaction.
+
+        Both crawl phases carry their own timeout, so reaching this means one of
+        the *untimed* Playwright protocol calls -- `new_context`, `new_page`,
+        `route` -- hung against a wedged browser. Derived rather than configured
+        precisely so it cannot be set below the phases it contains.
+        The margin covers those setup calls.
+        """
+        return self.navigation_timeout_seconds + self.page_timeout_seconds + 30.0
+
+    @computed_field
+    @cached_property
+    def outlink_publish_bound_seconds(self) -> float:
+        """
+        How long returning one page's links can take, at worst.
+        """
+        backoff = self.publish_retry_base_delay_seconds * (
+            2 ** (self.publish_max_attempts - 1) - 1
+        )
+        return self.publish_max_attempts * self.publish_timeout_seconds + backoff
+
+    @computed_field
+    @cached_property
+    def task_timeout_seconds(self) -> float:
+        """
+        Backstop deadline for a whole page task, covering the browser deadline
+        plus the publish and cleanup that run after it. Only reached if one of
+        the inner deadlines fails to do its job.
+        """
+        return (
+            self.browser_deadline_seconds
+            + self.outlink_publish_bound_seconds
+            + self.context_close_timeout_seconds
+            + self.amqp_ack_timeout_seconds
+            + 30.0
+        )
 
     @computed_field
     @cached_property
@@ -68,7 +140,11 @@ class HeritableData:
         return f"source:{self.source} heritable:{self.heritable}"
 
     def asdict(self) -> dict:
-        return asdict(self)
+        # Omit an absent source rather than emitting `"source": null`.
+        data = asdict(self)
+        if self.source is None:
+            del data["source"]
+        return data
 
 
 @dataclass
