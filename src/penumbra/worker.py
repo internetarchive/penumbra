@@ -437,7 +437,10 @@ async def process_page(
     deadline = asyncio.timeout(settings.browser_deadline_seconds)
     try:
         async with deadline:
-            context = await browser.new_context(accept_downloads=False)
+            context = await browser.new_context(
+                accept_downloads=False,
+                user_agent=message.metadata.user_agent,
+            )
             page = await context.new_page()
             await page.route("**/*", handle_route)
             page.on("request", lambda request: page_requests.add(request.url))

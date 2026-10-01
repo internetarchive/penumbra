@@ -34,7 +34,7 @@ def fresh_shutdown_event():
         yield event
 
 
-def message_maker(url: str) -> MagicMock:
+def message_maker(url: str, metadata: dict | None = None) -> MagicMock:
     message = MagicMock(spec=aio_pika.IncomingMessage)
     message.body = json.dumps(
         {
@@ -43,7 +43,8 @@ def message_maker(url: str) -> MagicMock:
                 "heritableData": {
                     "source": "test",
                     "heritable": ["source", "heritable"],
-                }
+                },
+                **(metadata or {}),
             },
             "clientId": "urls",
         }
@@ -732,6 +733,71 @@ async def test_process_page_refuses_downloads():
     await process_page(client, browser, message)
 
     assert browser.new_context.await_args.kwargs["accept_downloads"] is False
+
+
+@pytest.mark.asyncio
+async def test_process_page_crawls_as_heritrix():
+    """
+    Heritrix's UA carries the operator contact URL webmasters use to reach the
+    crawl operator. Requests the browser makes on Heritrix's behalf should be
+    attributable to the same crawl, not to an anonymous HeadlessChrome.
+    """
+    user_agent = "Mozilla/5.0 (compatible; heritrix/3.4.0 +https://example.com/info)"
+    message = message_maker("https://example.com", {"userAgent": user_agent})
+    message.ack = AsyncMock()
+    browser = page_browser_mock()
+
+    client = MagicMock(spec=AsyncMessageClient)
+    client.publish_message = AsyncMock()
+    await process_page(client, browser, message)
+
+    assert browser.new_context.await_args.kwargs["user_agent"] == user_agent
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        pytest.param({}, id="absent"),
+        pytest.param({"userAgent": None}, id="null"),
+        pytest.param({"userAgent": "   "}, id="blank"),
+        pytest.param({"userAgent": 7}, id="not-a-string"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_process_page_without_a_user_agent_uses_the_default(metadata):
+    """
+    Playwright drops a None `user_agent`; anything else -- including the empty
+    string -- would be sent verbatim as the UA.
+    """
+    message = message_maker("https://example.com", metadata)
+    message.ack = AsyncMock()
+    browser = page_browser_mock()
+
+    client = MagicMock(spec=AsyncMessageClient)
+    client.publish_message = AsyncMock()
+    await process_page(client, browser, message)
+
+    assert browser.new_context.await_args.kwargs["user_agent"] is None
+
+
+def test_user_agent_is_not_echoed_back_to_heritrix():
+    """
+    `parentUrlMetadata` is the reply Heritrix parses; the UA it told us to use
+    is not part of it.
+    """
+    user_agent = "Mozilla/5.0 (compatible; heritrix/3.4.0 +https://example.com/info)"
+    parent = UmbraMessage(
+        json.loads(message_maker("https://example.com", {"userAgent": user_agent}).body)
+    )
+    assert parent.metadata.user_agent == user_agent
+
+    response = UmbraResponse(
+        url="https://example.com/a",
+        method="GET",
+        headers={},
+        parent_message=parent,
+    ).asdict()
+    assert "userAgent" not in response["parentUrlMetadata"]
 
 
 def test_failure_reason_separates_the_two_timeout_classes():

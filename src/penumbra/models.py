@@ -147,10 +147,23 @@ class HeritableData:
         return data
 
 
+def clean_user_agent(value: object) -> str | None:
+    """
+    Heritrix sends `metadata.userAgent` only when it has one; absent, null and
+    blank all mean "no preference", which Playwright spells as None.
+    """
+    if not isinstance(value, str):
+        return None
+    return value.strip() or None
+
+
 @dataclass
 class UmbraMetadata:
     path_from_seed: str
     heritable_data: HeritableData
+    # Heritrix's own UA. None means Playwright's default. Not in `asdict`: an
+    # instruction to us, not part of the reply Heritrix reads back.
+    user_agent: str | None = None
 
     def __str__(self) -> str:
         return (
@@ -178,7 +191,8 @@ class UmbraMessage:
                 "heritable"
              ]
           },
-          "pathFromSeed":"LL"
+          "pathFromSeed":"LL",
+          "userAgent":"Mozilla/5.0 (compatible; heritrix/3.4.0 +https://example.com/crawl-info)"
        },
        "clientId":"example_crawl",
        "url":"https://example.com/sub/page"
@@ -199,6 +213,9 @@ class UmbraMessage:
         self.metadata = UmbraMetadata(
             path_from_seed=json_message.get("metadata").get("pathFromSeed"),
             heritable_data=heritable_data,
+            user_agent=clean_user_agent(
+                json_message["metadata"].get("userAgent"),
+            ),
         )
 
     def __str__(self) -> str:
