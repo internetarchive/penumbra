@@ -30,6 +30,7 @@ class AsyncMessageClient:
         publish_timeout=30.0,
         connect_timeout=60.0,
         recovery_timeout=10.0,
+        persistent_messages=False,
     ):
         """
         AsyncMessageClient
@@ -43,6 +44,10 @@ class AsyncMessageClient:
         :param connect_timeout: seconds to wait for a connection to become usable
         :param recovery_timeout: seconds to let aio-pika restore a dead channel
             in place before failing the publish that was waiting on it
+        :param persistent_messages: publish with delivery mode 2, so queued
+            messages survive a broker restart. Publisher confirms then wait on
+            the broker's disk write, and its recovery on restart lengthens in
+            proportion to the backlog.
         """
         self.amqp_url = amqp_url
         self.queue_name = queue_name
@@ -52,6 +57,7 @@ class AsyncMessageClient:
         self.publish_timeout = publish_timeout
         self.connect_timeout = connect_timeout
         self.recovery_timeout = recovery_timeout
+        self.persistent_messages = persistent_messages
         self.connection = None
         self.exchange = None
         self.queue = None
@@ -271,6 +277,11 @@ class AsyncMessageClient:
                 aio_pika.Message(
                     body=json.dumps(umbra_response.asdict()).encode(),
                     content_type="application/json",
+                    delivery_mode=(
+                        aio_pika.DeliveryMode.PERSISTENT
+                        if self.persistent_messages
+                        else aio_pika.DeliveryMode.NOT_PERSISTENT
+                    ),
                 ),
                 routing_key=routing_key,
             )

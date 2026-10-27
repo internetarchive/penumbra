@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     amqp_routing_key: str = Field(default="urls")
     amqp_exchange_name: str = Field(default="umbra")
     amqp_connect_timeout_seconds: float = Field(default=60.0, gt=0)
+    # Publish with delivery mode 2, so a broker restart no longer discards the
+    # return queue's contents. Off by default: it costs an eager disk write per
+    # message and lengthens broker recovery in proportion to the backlog.
+    amqp_persistent_messages: bool = Field(default=False)
     # How long to let aio-pika attempt to restore a channel the broker closed
     amqp_recovery_timeout_seconds: float = Field(default=10.0, gt=0)
     # Grace period for in-progress page tasks at shutdown.

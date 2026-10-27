@@ -606,6 +606,7 @@ async def main():
         publish_timeout=settings.publish_timeout_seconds,
         connect_timeout=settings.amqp_connect_timeout_seconds,
         recovery_timeout=settings.amqp_recovery_timeout_seconds,
+        persistent_messages=settings.amqp_persistent_messages,
     )
 
     # Setup Playwright
