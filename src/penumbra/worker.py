@@ -18,11 +18,16 @@ from prometheus_async.aio import time, track_inprogress
 from penumbra import metrics
 from penumbra.models import Settings, UmbraMessage, UmbraResponse
 from penumbra.queues import AsyncMessageClient
+from penumbra.recent import RecentlySent
 
 logger = logging.getLogger(__name__)
 # Add a global variable to manage shutdown signal
 shutdown_event = asyncio.Event()
 settings = Settings()
+# (client_id, url) pairs this process has published.
+recently_sent = RecentlySent(
+    settings.recently_sent_max_size, settings.recently_sent_ttl_seconds
+)
 
 
 class InstanceStalled(Exception):
@@ -111,18 +116,31 @@ async def publish_umbra_response(
                 )
                 metrics.penumbra_urls_dropped_too_long.inc(1)
                 continue
+            key = (parent_message.client_id, url)
+            repeat = key in recently_sent
+            if repeat:
+                metrics.penumbra_urls_recently_sent.inc(1)
+                if settings.recently_sent_enforce:
+                    continue
             umbra_response = UmbraResponse(
                 url=url,
                 method="GET",
                 headers={},
                 parent_message=parent_message,
             )
-            publishes.append(tg.create_task(publish_with_retry(client, umbra_response)))
+            task = tg.create_task(publish_with_retry(client, umbra_response))
+            # A repeat keeps its first send time, as it would if enforced.
+            publishes.append((None if repeat else key, task))
 
     if not publishes:
         return
 
-    published = sum(task.result() for task in publishes)
+    # Only what actually went out, so a dropped URL can be sent again.
+    for key, task in publishes:
+        if key is not None and task.result():
+            recently_sent.add(key)
+
+    published = sum(task.result() for _, task in publishes)
     if published == len(publishes):
         logger.info("Published %d links from %s", published, parent_message.url)
     else:

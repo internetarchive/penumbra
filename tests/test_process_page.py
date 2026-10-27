@@ -13,6 +13,7 @@ from prometheus_client import REGISTRY
 from penumbra import worker
 from penumbra.models import UmbraMessage, UmbraResponse
 from penumbra.queues import AsyncMessageClient
+from penumbra.recent import RecentlySent
 from penumbra.worker import (
     PageLoadTimeout,
     Settings,
@@ -247,6 +248,112 @@ async def test_publish_umbra_response_says_nothing_when_there_is_nothing_to_publ
     await publish_umbra_response(client, parent_message, set())
 
     client.publish_message.assert_not_awaited()
+
+
+@pytest.fixture
+def fresh_recently_sent(monkeypatch):
+    """Each test starts with nothing remembered as sent."""
+    recent = RecentlySent(max_size=100, ttl_seconds=3600)
+    monkeypatch.setattr(worker, "recently_sent", recent)
+    return recent
+
+
+def published_urls(client) -> list[str]:
+    return [call.args[0].url for call in client.publish_message.await_args_list]
+
+
+def recently_sent_count() -> float:
+    return REGISTRY.get_sample_value("penumbra_urls_recently_sent_total") or 0
+
+
+@pytest.mark.asyncio
+async def test_repeats_are_dropped_when_enforced(monkeypatch, fresh_recently_sent):
+    monkeypatch.setattr(worker.settings, "recently_sent_enforce", True)
+    parent_message = UmbraMessage(json.loads(message_maker("https://example.com").body))
+    client = MagicMock(spec=AsyncMessageClient)
+    client.publish_message = AsyncMock()
+    before = recently_sent_count()
+
+    await publish_umbra_response(client, parent_message, {"https://example.com/a"})
+    await publish_umbra_response(
+        client, parent_message, {"https://example.com/a", "https://example.com/b"}
+    )
+
+    assert sorted(published_urls(client)) == [
+        "https://example.com/a",
+        "https://example.com/b",
+    ]
+    assert recently_sent_count() == before + 1
+
+
+@pytest.mark.asyncio
+async def test_repeats_are_only_counted_in_shadow_mode(
+    monkeypatch, fresh_recently_sent
+):
+    monkeypatch.setattr(worker.settings, "recently_sent_enforce", False)
+    parent_message = UmbraMessage(json.loads(message_maker("https://example.com").body))
+    client = MagicMock(spec=AsyncMessageClient)
+    client.publish_message = AsyncMock()
+    before = recently_sent_count()
+
+    await publish_umbra_response(client, parent_message, {"https://example.com/a"})
+    await publish_umbra_response(client, parent_message, {"https://example.com/a"})
+
+    assert published_urls(client) == ["https://example.com/a"] * 2
+    assert recently_sent_count() == before + 1
+
+
+@pytest.mark.asyncio
+async def test_shadow_mode_keeps_the_first_send_time(monkeypatch):
+    """A counted repeat must not refresh the TTL, or shadow would overcount."""
+    monkeypatch.setattr(worker.settings, "recently_sent_enforce", False)
+    now = [0.0]
+    recent = RecentlySent(max_size=100, ttl_seconds=60, clock=lambda: now[0])
+    monkeypatch.setattr(worker, "recently_sent", recent)
+    parent_message = UmbraMessage(json.loads(message_maker("https://example.com").body))
+    client = MagicMock(spec=AsyncMessageClient)
+    client.publish_message = AsyncMock()
+
+    await publish_umbra_response(client, parent_message, {"https://example.com/a"})
+    now[0] = 50
+    await publish_umbra_response(client, parent_message, {"https://example.com/a"})
+    now[0] = 61
+
+    assert ("urls", "https://example.com/a") not in recent
+
+
+@pytest.mark.asyncio
+async def test_recently_sent_is_per_client(monkeypatch, fresh_recently_sent):
+    """Each crawler has its own uniq filter, so one's sends say nothing of another's."""
+    monkeypatch.setattr(worker.settings, "recently_sent_enforce", True)
+    client = MagicMock(spec=AsyncMessageClient)
+    client.publish_message = AsyncMock()
+
+    for client_id in ("crawl_0", "crawl_1"):
+        body = json.loads(message_maker("https://example.com").body)
+        body["clientId"] = client_id
+        await publish_umbra_response(
+            client, UmbraMessage(body), {"https://example.com/a"}
+        )
+
+    assert client.publish_message.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_url_that_failed_to_publish_is_not_remembered(
+    monkeypatch, fresh_recently_sent
+):
+    monkeypatch.setattr(worker.settings, "recently_sent_enforce", True)
+    monkeypatch.setattr(worker.settings, "publish_retry_base_delay_seconds", 0)
+    monkeypatch.setattr(worker.settings, "publish_max_attempts", 1)
+    parent_message = UmbraMessage(json.loads(message_maker("https://example.com").body))
+    client = MagicMock(spec=AsyncMessageClient)
+    client.publish_message = AsyncMock(side_effect=[ConnectionError("boom"), None])
+
+    await publish_umbra_response(client, parent_message, {"https://example.com/a"})
+    await publish_umbra_response(client, parent_message, {"https://example.com/a"})
+
+    assert client.publish_message.await_count == 2
 
 
 @pytest.mark.asyncio

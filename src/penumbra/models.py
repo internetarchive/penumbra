@@ -31,6 +31,14 @@ class Settings(BaseSettings):
     # Heritrix rejects URLs longer than its UURI limit (2083 chars), so drop
     # over-length URLs before enqueueing rather than publishing dead links.
     max_url_length: int = Field(default=2083, ge=1)
+    # Remember the URLs published per client, so repeats of a site's shared
+    # assets are not sent again. Heritrix's uniq filter would drop them anyway.
+    # The TTL bounds staleness across a new crawl that reuses a client id.
+    # 0 disables.
+    recently_sent_max_size: int = Field(default=200_000, ge=0)
+    recently_sent_ttl_seconds: float = Field(default=4 * 3600.0, gt=0)
+    # Off: repeats are only counted. On: they are not published.
+    recently_sent_enforce: bool = Field(default=False)
     # Time to wait for a server to respond to the initial request
     navigation_timeout_seconds: float = Field(default=30.0, gt=0)
     # Time to wait for a page to be considered finished requestion resources. After this,
