@@ -2,7 +2,7 @@ from dataclasses import asdict, dataclass
 from functools import cached_property
 from typing import Literal
 
-from pydantic import Field, computed_field
+from pydantic import Field, computed_field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     amqp_routing_key: str = Field(default="urls")
     amqp_exchange_name: str = Field(default="umbra")
     amqp_connect_timeout_seconds: float = Field(default=60.0, gt=0)
+    # Publish with delivery mode 2, so a broker restart no longer discards the
+    # return queue's contents. Off by default: it costs an eager disk write per
+    # message and lengthens broker recovery in proportion to the backlog.
+    amqp_persistent_messages: bool = Field(default=False)
     # How long to let aio-pika attempt to restore a channel the broker closed
     amqp_recovery_timeout_seconds: float = Field(default=10.0, gt=0)
     # Grace period for in-progress page tasks at shutdown.
@@ -31,6 +35,14 @@ class Settings(BaseSettings):
     # Heritrix rejects URLs longer than its UURI limit (2083 chars), so drop
     # over-length URLs before enqueueing rather than publishing dead links.
     max_url_length: int = Field(default=2083, ge=1)
+    # Remember the URLs published per client, so repeats of a site's shared
+    # assets are not sent again. Heritrix's uniq filter would drop them anyway.
+    # The TTL bounds staleness across a new crawl that reuses a client id.
+    # 0 disables.
+    recently_sent_max_size: int = Field(default=200_000, ge=0)
+    recently_sent_ttl_seconds: float = Field(default=4 * 3600.0, gt=0)
+    # Off: repeats are only counted. On: they are not published.
+    recently_sent_enforce: bool = Field(default=False)
     # Time to wait for a server to respond to the initial request
     navigation_timeout_seconds: float = Field(default=30.0, gt=0)
     # Time to wait for a page to be considered finished requestion resources. After this,
@@ -42,6 +54,10 @@ class Settings(BaseSettings):
     publish_max_attempts: int = Field(default=3, ge=1)
     publish_retry_base_delay_seconds: float = Field(default=0.5, gt=0)
     install_playwright: bool = Field(default=True)
+    # A Chromium binary to run instead of the one Playwright pins, e.g. a newer
+    # Chrome for Testing headless shell carrying security fixes. Unset or blank
+    # uses Playwright's own.
+    chromium_executable_path: str | None = Field(default=None)
     skip_resource_document: bool = Field(default=False)
     skip_resource_stylesheet: bool = Field(default=False)
     skip_resource_image: bool = Field(default=False)
@@ -59,6 +75,11 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", env_prefix="penumbra_"
     )
+
+    @field_validator("chromium_executable_path")
+    @classmethod
+    def blank_is_unset(cls, value: str | None) -> str | None:
+        return (value or "").strip() or None
 
     @computed_field
     @cached_property

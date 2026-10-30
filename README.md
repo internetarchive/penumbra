@@ -22,6 +22,110 @@ make run
 If metrics are enabled (the default), Prometheus metrics are available to scrape at
 http://127.0.0.1:8888.
 
+## Configuration
+
+Settings are read from environment variables, or a `.env` file, prefixed `PENUMBRA_`.
+Each is a field of `Settings` in `src/penumbra/models.py`.
+
+### Browser
+
+| Variable | Default | Description |
+|---|---|---|
+| `PENUMBRA_BROWSER_POOL_SIZE` | `1` | Chromium processes to launch. Pages are spread across them round-robin. |
+| `PENUMBRA_CONTEXTS_PER_BROWSER` | `1` | Pages each browser crawls at once. Pool size × this is the concurrency limit, and the AMQP prefetch count. |
+| `PENUMBRA_CHROMIUM_EXECUTABLE_PATH` | unset | Chromium binary to run instead of Playwright's. See [Using a different Chromium](#using-a-different-chromium). |
+| `PENUMBRA_INSTALL_PLAYWRIGHT` | `true` | Run `playwright install --with-deps chromium` at startup. |
+| `PENUMBRA_EVENT_LOOP` | `asyncio` | `asyncio` or `uvloop`. `uvloop` needs the `uvloop` extra installed. |
+
+### Page timeouts
+
+A page is crawled in two phases, each with its own timeout. Whatever a page requested
+before a timeout is still published.
+
+| Variable | Default | Description |
+|---|---|---|
+| `PENUMBRA_NAVIGATION_TIMEOUT_SECONDS` | `30` | Phase 1: wait for the server to answer and the document to commit. |
+| `PENUMBRA_PAGE_TIMEOUT_SECONDS` | `120` | Phase 2: wait for the page's subresources to finish loading. |
+| `PENUMBRA_CONTEXT_CLOSE_TIMEOUT_SECONDS` | `30` | Bound on closing a page's browser context. |
+
+### Skipping resource types
+
+Each of these, when `true`, aborts requests of that Playwright resource type instead of
+loading them. This saves bandwidth, but the URLs are still published to Heritrix,
+which fetches them itself. Anything a skipped resource would have requested in turn,
+such as a script's own requests, is never seen. All default to `false`.
+
+`PENUMBRA_SKIP_RESOURCE_DOCUMENT`, `PENUMBRA_SKIP_RESOURCE_STYLESHEET`,
+`PENUMBRA_SKIP_RESOURCE_IMAGE`, `PENUMBRA_SKIP_RESOURCE_MEDIA`,
+`PENUMBRA_SKIP_RESOURCE_FONT`, `PENUMBRA_SKIP_RESOURCE_SCRIPT`,
+`PENUMBRA_SKIP_RESOURCE_TEXTTRACK`, `PENUMBRA_SKIP_RESOURCE_XHR`,
+`PENUMBRA_SKIP_RESOURCE_FETCH`, `PENUMBRA_SKIP_RESOURCE_EVENTSOURCE`,
+`PENUMBRA_SKIP_RESOURCE_WEBSOCKET`, `PENUMBRA_SKIP_RESOURCE_MANIFEST`,
+`PENUMBRA_SKIP_RESOURCE_OTHER`
+
+### AMQP
+
+Penumbra consumes from one durable queue, bound to the exchange with the routing key
+below. Each page's discovered URLs are published to the same exchange, routed by the
+page's Heritrix `clientId`.
+
+| Variable | Default | Description |
+|---|---|---|
+| `PENUMBRA_AMQP_URL` | `amqp://guest:guest@localhost:5672/%2f` | Broker URL. |
+| `PENUMBRA_AMQP_QUEUE_NAME` | `urls` | Queue to consume pages from. |
+| `PENUMBRA_AMQP_ROUTING_KEY` | `urls` | Routing key binding that queue to the exchange. |
+| `PENUMBRA_AMQP_EXCHANGE_NAME` | `umbra` | Exchange for both consuming and publishing. |
+| `PENUMBRA_AMQP_PERSISTENT_MESSAGES` | `false` | Publish with delivery mode 2, so queued URLs survive a broker restart. Costs a disk write per message and slows broker recovery in proportion to the backlog. |
+| `PENUMBRA_AMQP_CONNECT_TIMEOUT_SECONDS` | `60` | Wait for a usable connection. |
+| `PENUMBRA_AMQP_RECOVERY_TIMEOUT_SECONDS` | `10` | Time aio-pika gets to restore a channel the broker closed. |
+| `PENUMBRA_AMQP_ACK_TIMEOUT_SECONDS` | `30` | Bound on acking a finished page. |
+
+### Publishing
+
+| Variable | Default | Description |
+|---|---|---|
+| `PENUMBRA_PUBLISH_TIMEOUT_SECONDS` | `30` | Bound on one publish attempt. |
+| `PENUMBRA_PUBLISH_MAX_ATTEMPTS` | `3` | Attempts per URL before it is dropped and counted in `penumbra_urls_dropped_publish_failed`. |
+| `PENUMBRA_PUBLISH_RETRY_BASE_DELAY_SECONDS` | `0.5` | First retry delay, doubling each attempt. |
+| `PENUMBRA_MAX_URL_LENGTH` | `2083` | Longer URLs are dropped, since Heritrix rejects them. |
+| `PENUMBRA_RECENTLY_SENT_MAX_SIZE` | `200000` | URLs remembered as already published, per process. `0` disables. |
+| `PENUMBRA_RECENTLY_SENT_TTL_SECONDS` | `14400` | How long a published URL counts as recent, measured from when it was first sent. |
+| `PENUMBRA_RECENTLY_SENT_ENFORCE` | `false` | Drop URLs already published for the same `clientId` within the TTL. Off, they are only counted in `penumbra_urls_recently_sent`. Heritrix would discard them anyway. |
+
+### Health and shutdown
+
+| Variable | Default | Description |
+|---|---|---|
+| `PENUMBRA_WATCHDOG_INTERVAL_SECONDS` | `30` | How often the broker connection is checked. |
+| `PENUMBRA_BROKER_UNHEALTHY_EXIT_SECONDS` | `300` | Exit, for the supervisor to restart, once the broker has been unusable this long. |
+| `PENUMBRA_SHUTDOWN_DRAIN_TIMEOUT_SECONDS` | `30` | Grace period for in-progress pages on shutdown. Unfinished pages are redelivered. |
+| `PENUMBRA_METRICS_ENABLED` | `true` | Serve Prometheus metrics. |
+| `PENUMBRA_METRICS_PORT` | `8888` | Metrics port. |
+
+### Using a different Chromium
+
+By default Penumbra runs the Chromium build pinned by its Playwright version. To run
+another, such as a newer Chrome for Testing release carrying security fixes that
+Playwright hasn't picked up yet, set:
+
+```shell
+PENUMBRA_CHROMIUM_EXECUTABLE_PATH=/opt/chrome-headless-shell-linux64/chrome-headless-shell
+```
+
+Unset or blank uses Playwright's build. Penumbra runs headless, so the closest match to
+the default is the `chrome-headless-shell` build. Chrome for Testing publishes every
+release at
+`https://storage.googleapis.com/chrome-for-testing-public/<version>/linux64/chrome-headless-shell-linux64.zip`;
+the current versions are listed at
+https://googlechromelabs.github.io/chrome-for-testing/.
+
+Playwright only supports the Chromium it pins, so stay on the same major version, or
+test before going further ahead. The version actually launched is logged at startup:
+
+```
+Launched Chromium 156.0.8078.80 from /opt/chrome-headless-shell-linux64/chrome-headless-shell
+```
+
 ## Sample crawl with Docker Compose
 
 A complete sample crawl environment - Heritrix, Penumbra, RabbitMQ, and Prometheus -

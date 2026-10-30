@@ -4,6 +4,7 @@ from contextlib import suppress
 from time import monotonic
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aio_pika
 import pytest
 from prometheus_client import REGISTRY
 
@@ -518,3 +519,39 @@ async def test_publish_message_is_bounded_by_publish_timeout():
                 client.publish_message(response), timeout=GUARD_TIMEOUT
             )
     assert monotonic() - started < 1
+
+
+@pytest.mark.asyncio
+async def test_publish_is_transient_by_default():
+    """
+    Messages carry delivery mode 1 unless asked otherwise, which is what the
+    broker discards on restart. Off by default so enabling durability stays a
+    deployment decision rather than a surprise.
+    """
+    connection = connection_mock()
+    client = AsyncMessageClient()
+    response = MagicMock(client_id="urls")
+    response.asdict.return_value = {"url": "https://example.com"}
+
+    with patch("aio_pika.connect_robust", AsyncMock(return_value=connection)):
+        await client.connect()
+        await client.publish_message(response)
+
+    (message,), _ = client.exchange.publish.call_args
+    assert message.delivery_mode == aio_pika.DeliveryMode.NOT_PERSISTENT
+
+
+@pytest.mark.asyncio
+async def test_publish_is_persistent_when_configured():
+    """Delivery mode 2 is what makes a durable queue's contents survive."""
+    connection = connection_mock()
+    client = AsyncMessageClient(persistent_messages=True)
+    response = MagicMock(client_id="urls")
+    response.asdict.return_value = {"url": "https://example.com"}
+
+    with patch("aio_pika.connect_robust", AsyncMock(return_value=connection)):
+        await client.connect()
+        await client.publish_message(response)
+
+    (message,), _ = client.exchange.publish.call_args
+    assert message.delivery_mode == aio_pika.DeliveryMode.PERSISTENT

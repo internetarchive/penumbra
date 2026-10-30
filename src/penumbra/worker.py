@@ -18,11 +18,16 @@ from prometheus_async.aio import time, track_inprogress
 from penumbra import metrics
 from penumbra.models import Settings, UmbraMessage, UmbraResponse
 from penumbra.queues import AsyncMessageClient
+from penumbra.recent import RecentlySent
 
 logger = logging.getLogger(__name__)
 # Add a global variable to manage shutdown signal
 shutdown_event = asyncio.Event()
 settings = Settings()
+# (client_id, url) pairs this process has published.
+recently_sent = RecentlySent(
+    settings.recently_sent_max_size, settings.recently_sent_ttl_seconds
+)
 
 
 class InstanceStalled(Exception):
@@ -111,18 +116,31 @@ async def publish_umbra_response(
                 )
                 metrics.penumbra_urls_dropped_too_long.inc(1)
                 continue
+            key = (parent_message.client_id, url)
+            repeat = key in recently_sent
+            if repeat:
+                metrics.penumbra_urls_recently_sent.inc(1)
+                if settings.recently_sent_enforce:
+                    continue
             umbra_response = UmbraResponse(
                 url=url,
                 method="GET",
                 headers={},
                 parent_message=parent_message,
             )
-            publishes.append(tg.create_task(publish_with_retry(client, umbra_response)))
+            task = tg.create_task(publish_with_retry(client, umbra_response))
+            # A repeat keeps its first send time, as it would if enforced.
+            publishes.append((None if repeat else key, task))
 
     if not publishes:
         return
 
-    published = sum(task.result() for task in publishes)
+    # Only what actually went out, so a dropped URL can be sent again.
+    for key, task in publishes:
+        if key is not None and task.result():
+            recently_sent.add(key)
+
+    published = sum(task.result() for _, task in publishes)
     if published == len(publishes):
         logger.info("Published %d links from %s", published, parent_message.url)
     else:
@@ -556,6 +574,19 @@ async def or_shutdown(awaitable):
         _abandon(task)
 
 
+async def launch_browser(pw) -> Browser:
+    """Launch Chromium, from `chromium_executable_path` if one is set."""
+    browser = await pw.chromium.launch(
+        executable_path=settings.chromium_executable_path
+    )
+    logger.info(
+        "Launched Chromium %s from %s",
+        browser.version,
+        settings.chromium_executable_path or "Playwright's bundled build",
+    )
+    return browser
+
+
 def ensure_playwright_installed():
     """Installs playwright's browser and all dependencies (if needed) at runtime."""
     import subprocess
@@ -588,6 +619,7 @@ async def main():
         publish_timeout=settings.publish_timeout_seconds,
         connect_timeout=settings.amqp_connect_timeout_seconds,
         recovery_timeout=settings.amqp_recovery_timeout_seconds,
+        persistent_messages=settings.amqp_persistent_messages,
     )
 
     # Setup Playwright
@@ -596,7 +628,7 @@ async def main():
     browser_pool = []
     for i in range(settings.browser_pool_size):
         pw = await async_playwright().start()
-        browser = await pw.chromium.launch()
+        browser = await launch_browser(pw)
         browser_pool.append({"playwright": pw, "browser": browser})
 
     # Divide page crawl tasks round-robin to browsers

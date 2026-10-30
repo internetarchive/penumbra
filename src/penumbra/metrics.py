@@ -11,6 +11,7 @@ penumbra_broker_connected = Gauge("penumbra_broker_connected", "1 while a usable
 penumbra_url_publishing_duration_seconds = Histogram("penumbra_url_publishing_duration_seconds", "time spent publishing URLs to RabbitMQ in penumbra")
 penumbra_amqp_publish_exceptions = Counter("penumbra_amqp_publish_exceptions", "count of exceptions thrown while publishing umbra responses")
 penumbra_amqp_publish_retries = Counter("penumbra_amqp_publish_retries", "count of publish attempts retried after a failure")
+penumbra_urls_recently_sent = Counter("penumbra_urls_recently_sent", "URLs already published for the same client within the TTL; dropped when recently_sent_enforce is set, otherwise still published and only counted")
 penumbra_urls_dropped_publish_failed = Counter("penumbra_urls_dropped_publish_failed", "number of URLs dropped after every publish attempt failed")
 penumbra_pages_failed = Counter("penumbra_pages_failed", "pages that did not load cleanly, by reason; reason is the Chromium net:: error code where there is one, otherwise a fixed string or an exception class name -- reason=\"page_timeout\" is a page whose subresources never finished, whose links are still published", labelnames=["reason"])
 penumbra_page_task_deadline_exceeded = Counter("penumbra_page_task_deadline_exceeded", "number of page tasks killed by the backstop deadline; nonzero means an inner timeout failed to fire")
