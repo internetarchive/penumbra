@@ -574,6 +574,19 @@ async def or_shutdown(awaitable):
         _abandon(task)
 
 
+async def launch_browser(pw) -> Browser:
+    """Launch Chromium, from `chromium_executable_path` if one is set."""
+    browser = await pw.chromium.launch(
+        executable_path=settings.chromium_executable_path
+    )
+    logger.info(
+        "Launched Chromium %s from %s",
+        browser.version,
+        settings.chromium_executable_path or "Playwright's bundled build",
+    )
+    return browser
+
+
 def ensure_playwright_installed():
     """Installs playwright's browser and all dependencies (if needed) at runtime."""
     import subprocess
@@ -615,7 +628,7 @@ async def main():
     browser_pool = []
     for i in range(settings.browser_pool_size):
         pw = await async_playwright().start()
-        browser = await pw.chromium.launch()
+        browser = await launch_browser(pw)
         browser_pool.append({"playwright": pw, "browser": browser})
 
     # Divide page crawl tasks round-robin to browsers

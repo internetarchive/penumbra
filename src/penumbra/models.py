@@ -2,7 +2,7 @@ from dataclasses import asdict, dataclass
 from functools import cached_property
 from typing import Literal
 
-from pydantic import Field, computed_field
+from pydantic import Field, computed_field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     publish_max_attempts: int = Field(default=3, ge=1)
     publish_retry_base_delay_seconds: float = Field(default=0.5, gt=0)
     install_playwright: bool = Field(default=True)
+    # A Chromium binary to run instead of the one Playwright pins, e.g. a newer
+    # Chrome for Testing headless shell carrying security fixes. Unset or blank
+    # uses Playwright's own.
+    chromium_executable_path: str | None = Field(default=None)
     skip_resource_document: bool = Field(default=False)
     skip_resource_stylesheet: bool = Field(default=False)
     skip_resource_image: bool = Field(default=False)
@@ -71,6 +75,11 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", env_prefix="penumbra_"
     )
+
+    @field_validator("chromium_executable_path")
+    @classmethod
+    def blank_is_unset(cls, value: str | None) -> str | None:
+        return (value or "").strip() or None
 
     @computed_field
     @cached_property
