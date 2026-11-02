@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import aio_pika
 import pytest
+from aio_pika.exceptions import DeliveryError, PublishError
+from pamqp import commands as spec
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
@@ -175,6 +177,94 @@ async def test_publish_with_retry_drops_after_exhausting_attempts(monkeypatch):
         REGISTRY.get_sample_value("penumbra_urls_dropped_publish_failed_total") or 0
     )
     assert dropped_post == dropped_pre + 1
+
+
+def _response() -> UmbraResponse:
+    parent_message = UmbraMessage(json.loads(message_maker("https://example.com").body))
+    return UmbraResponse(
+        url="https://example.com/x",
+        method="GET",
+        headers={},
+        parent_message=parent_message,
+    )
+
+
+@pytest.mark.asyncio
+async def test_publish_with_retry_drops_a_nacked_url_without_retrying(monkeypatch):
+    """
+    A nack is the broker refusing the message (a full queue under
+    reject-publish), so it is dropped on the first attempt and counted apart
+    from URLs whose retries ran out.
+    """
+    monkeypatch.setattr(worker.settings, "publish_retry_base_delay_seconds", 0)
+    monkeypatch.setattr(worker.settings, "publish_max_attempts", 3)
+
+    client = MagicMock(spec=AsyncMessageClient)
+    client.publish_message = AsyncMock(
+        side_effect=DeliveryError(None, spec.Basic.Nack(delivery_tag=1))
+    )
+
+    rejected_pre = (
+        REGISTRY.get_sample_value("penumbra_urls_dropped_publish_rejected_total") or 0
+    )
+    failed_pre = (
+        REGISTRY.get_sample_value("penumbra_urls_dropped_publish_failed_total") or 0
+    )
+    retries_pre = REGISTRY.get_sample_value("penumbra_amqp_publish_retries_total") or 0
+
+    assert await worker.publish_with_retry(client, _response()) is False
+    assert client.publish_message.await_count == 1
+
+    assert (
+        REGISTRY.get_sample_value("penumbra_urls_dropped_publish_rejected_total") or 0
+    ) == rejected_pre + 1
+    assert (
+        REGISTRY.get_sample_value("penumbra_urls_dropped_publish_failed_total") or 0
+    ) == failed_pre
+    assert (
+        REGISTRY.get_sample_value("penumbra_amqp_publish_retries_total") or 0
+    ) == retries_pre
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        # A memory or disk alarm blocks the publisher until publish_timeout.
+        TimeoutError(),
+        # A broker restart closes the connection with confirms pending.
+        aio_pika.exceptions.AMQPConnectionError("connection closed"),
+        aio_pika.exceptions.ChannelInvalidStateError("channel closed"),
+        # A returned message is not a nack, though it shares the base class.
+        PublishError(
+            MagicMock(
+                delivery=spec.Basic.Return(
+                    reply_code=312, reply_text="NO_ROUTE", routing_key="x"
+                )
+            ),
+            MagicMock(),
+        ),
+    ],
+    ids=["alarm_timeout", "connection_closed", "channel_closed", "returned"],
+)
+async def test_publish_with_retry_still_retries_everything_but_a_nack(
+    monkeypatch, error
+):
+    monkeypatch.setattr(worker.settings, "publish_retry_base_delay_seconds", 0)
+    monkeypatch.setattr(worker.settings, "publish_max_attempts", 3)
+
+    client = MagicMock(spec=AsyncMessageClient)
+    client.publish_message = AsyncMock(side_effect=[error, None])
+
+    rejected_pre = (
+        REGISTRY.get_sample_value("penumbra_urls_dropped_publish_rejected_total") or 0
+    )
+
+    assert await worker.publish_with_retry(client, _response()) is True
+    assert client.publish_message.await_count == 2
+    assert (
+        REGISTRY.get_sample_value("penumbra_urls_dropped_publish_rejected_total") or 0
+    ) == rejected_pre
 
 
 @pytest.mark.asyncio
@@ -349,6 +439,24 @@ async def test_a_url_that_failed_to_publish_is_not_remembered(
     parent_message = UmbraMessage(json.loads(message_maker("https://example.com").body))
     client = MagicMock(spec=AsyncMessageClient)
     client.publish_message = AsyncMock(side_effect=[ConnectionError("boom"), None])
+
+    await publish_umbra_response(client, parent_message, {"https://example.com/a"})
+    await publish_umbra_response(client, parent_message, {"https://example.com/a"})
+
+    assert client.publish_message.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_url_the_broker_rejected_is_not_remembered(
+    monkeypatch, fresh_recently_sent
+):
+    """A full queue drains, so the same link found later must still go out."""
+    monkeypatch.setattr(worker.settings, "recently_sent_enforce", True)
+    parent_message = UmbraMessage(json.loads(message_maker("https://example.com").body))
+    client = MagicMock(spec=AsyncMessageClient)
+    client.publish_message = AsyncMock(
+        side_effect=[DeliveryError(None, spec.Basic.Nack(delivery_tag=1)), None]
+    )
 
     await publish_umbra_response(client, parent_message, {"https://example.com/a"})
     await publish_umbra_response(client, parent_message, {"https://example.com/a"})

@@ -13,6 +13,7 @@ penumbra_amqp_publish_exceptions = Counter("penumbra_amqp_publish_exceptions", "
 penumbra_amqp_publish_retries = Counter("penumbra_amqp_publish_retries", "count of publish attempts retried after a failure")
 penumbra_urls_recently_sent = Counter("penumbra_urls_recently_sent", "URLs already published for the same client within the TTL; dropped when recently_sent_enforce is set, otherwise still published and only counted")
 penumbra_urls_dropped_publish_failed = Counter("penumbra_urls_dropped_publish_failed", "number of URLs dropped after every publish attempt failed")
+penumbra_urls_dropped_publish_rejected = Counter("penumbra_urls_dropped_publish_rejected", "number of URLs dropped because the broker nacked the publish, e.g. a return queue at its max-length under reject-publish; not retried")
 penumbra_pages_failed = Counter("penumbra_pages_failed", "pages that did not load cleanly, by reason; reason is the Chromium net:: error code where there is one, otherwise a fixed string or an exception class name -- reason=\"page_timeout\" is a page whose subresources never finished, whose links are still published", labelnames=["reason"])
 penumbra_page_task_deadline_exceeded = Counter("penumbra_page_task_deadline_exceeded", "number of page tasks killed by the backstop deadline; nonzero means an inner timeout failed to fire")
 penumbra_resources_requested = Counter("penumbra_resources_requested", "number of resources requested", labelnames=["resource_type"])
