@@ -10,6 +10,7 @@ from time import monotonic
 from urllib.parse import urlsplit, urlunsplit
 
 import aio_pika
+from aio_pika.exceptions import DeliveryError, PublishError
 from playwright.async_api import Browser, Request, Response, Route, async_playwright
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -61,7 +62,8 @@ async def publish_with_retry(
 
     Never raises: a single unpublishable URL must not cancel its sibling
     publishes via the enclosing `TaskGroup`, nor fail the whole page. Once the
-    attempts are exhausted the URL is dropped loudly.
+    attempts are exhausted the URL is dropped loudly. A URL the broker nacks is
+    dropped quietly on the first attempt instead.
     Returns True if the response was published.
     """
     delay = settings.publish_retry_base_delay_seconds
@@ -72,6 +74,20 @@ async def publish_with_retry(
         # CancelledError is a BaseException, so an outer deadline still aborts
         # the retry loop rather than being retried through.
         except Exception as e:
+            # A nack is the broker refusing this message, e.g. a return queue at
+            # its max-length under `reject-publish`. Retrying will not change
+            # that answer, so drop it now. Alarms, restarts and dropped
+            # connections never nack -- they surface as timeouts or closed
+            # channels -- so they still go through the retries below.
+            # PublishError is the returned-message subclass, not a nack.
+            if isinstance(e, DeliveryError) and not isinstance(e, PublishError):
+                logger.debug(
+                    "Broker rejected %s (parent %s); dropping it",
+                    umbra_response.url,
+                    umbra_response.parent_url,
+                )
+                metrics.penumbra_urls_dropped_publish_rejected.inc(1)
+                return False
             metrics.penumbra_amqp_publish_exceptions.inc(1)
             if attempt == settings.publish_max_attempts:
                 logger.error(
@@ -145,8 +161,7 @@ async def publish_umbra_response(
         logger.info("Published %d links from %s", published, parent_message.url)
     else:
         logger.warning(
-            "Published %d of %d links from %s; the rest were dropped after every "
-            "attempt failed",
+            "Published %d of %d links from %s; the rest were dropped",
             published,
             len(publishes),
             parent_message.url,
