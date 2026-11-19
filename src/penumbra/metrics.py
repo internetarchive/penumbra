@@ -20,7 +20,12 @@ penumbra_resources_requested = Counter("penumbra_resources_requested", "number o
 penumbra_resources_fetched = Counter("penumbra_resources_fetched", "number of resources fetched", labelnames=["resource_type", "status_code"])
 penumbra_resources_size_bytes = Counter("penumbra_resources_size_bytes", "total size of resources fetched", labelnames=["resource_type"])
 penumbra_resources_fetch_time = Counter("penumbra_resources_fetch_time", "time spent fetching resources", labelnames=["resource_type"])
+penumbra_pages_user_agent = Counter("penumbra_pages_user_agent", "pages attempted, by the user agent the browser was given: the metadata.userAgent string Heritrix sent; \"default\" when it sent none and Playwright's HeadlessChrome UA was used, so nonzero default means Heritrix is not sending its UA; \"other\" once more distinct UAs have been seen than this process will label", labelnames=["user_agent"])
+penumbra_urls_dropped_excluded_host = Counter("penumbra_urls_dropped_excluded_host", "number of URLs dropped before publishing because their host is in excluded_outlink_hosts, by host", labelnames=["host"])
 # fmt: on
+
+# Exists from startup, so the "Heritrix sent no UA" alert reads 0, not absent.
+penumbra_pages_user_agent.labels("default")
 
 
 def register_prom_metrics(metrics_port: int = 8888):

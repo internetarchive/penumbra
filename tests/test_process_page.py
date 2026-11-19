@@ -37,6 +37,15 @@ def fresh_shutdown_event():
         yield event
 
 
+def pages_with_user_agent(label: str) -> float:
+    return (
+        REGISTRY.get_sample_value(
+            "penumbra_pages_user_agent_total", {"user_agent": label}
+        )
+        or 0
+    )
+
+
 def message_maker(url: str, metadata: dict | None = None) -> MagicMock:
     message = MagicMock(spec=aio_pika.IncomingMessage)
     message.body = json.dumps(
@@ -964,9 +973,13 @@ async def test_process_page_crawls_as_heritrix():
 
     client = MagicMock(spec=AsyncMessageClient)
     client.publish_message = AsyncMock()
+    ua_pre = pages_with_user_agent(user_agent)
+    default_pre = pages_with_user_agent("default")
     await process_page(client, browser, message)
 
     assert browser.new_context.await_args.kwargs["user_agent"] == user_agent
+    assert pages_with_user_agent(user_agent) == ua_pre + 1
+    assert pages_with_user_agent("default") == default_pre
 
 
 @pytest.mark.parametrize(
@@ -990,9 +1003,11 @@ async def test_process_page_without_a_user_agent_uses_the_default(metadata):
 
     client = MagicMock(spec=AsyncMessageClient)
     client.publish_message = AsyncMock()
+    default_pre = pages_with_user_agent("default")
     await process_page(client, browser, message)
 
     assert browser.new_context.await_args.kwargs["user_agent"] is None
+    assert pages_with_user_agent("default") == default_pre + 1
 
 
 def test_user_agent_is_not_echoed_back_to_heritrix():
@@ -1329,3 +1344,28 @@ async def test_over_release_is_reported_but_does_not_raise(caplog):
     # rejected release handed out no extra permit. One acquire still exhausts it.
     await asyncio.wait_for(semaphore.acquire(), timeout=1)
     assert semaphore.locked()
+
+
+def test_user_agent_labels_are_capped(monkeypatch, caplog):
+    """
+    Each distinct UA is a series for the life of the process, so one sender
+    varying it per message must not grow them without bound.
+    """
+    monkeypatch.setattr(worker, "labelled_user_agents", set())
+    monkeypatch.setattr(worker, "MAX_USER_AGENT_LABELS", 2)
+
+    with caplog.at_level(logging.INFO, logger="penumbra.worker"):
+        assert worker.user_agent_label("ua-1") == "ua-1"
+        assert worker.user_agent_label("ua-1") == "ua-1"
+        assert worker.user_agent_label("ua-2") == "ua-2"
+        assert worker.user_agent_label("ua-3") == "other"
+        # Already labelled before the cap was reached: keeps its own label.
+        assert worker.user_agent_label("ua-1") == "ua-1"
+        assert worker.user_agent_label(None) == "default"
+
+    # Logged once per newly labelled UA, not per page.
+    logged = [r.getMessage() for r in caplog.records if "user agent" in r.getMessage()]
+    assert logged == [
+        "Crawling with user agent from Heritrix: ua-1",
+        "Crawling with user agent from Heritrix: ua-2",
+    ]

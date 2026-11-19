@@ -5,7 +5,6 @@ import re
 import signal
 from contextlib import suppress
 from itertools import cycle
-
 from time import monotonic
 from urllib.parse import urlsplit, urlunsplit
 
@@ -17,7 +16,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from prometheus_async.aio import time, track_inprogress
 
 from penumbra import metrics
-from penumbra.models import Settings, UmbraMessage, UmbraResponse
+from penumbra.models import Settings, UmbraMessage, UmbraResponse, normalize_host
 from penumbra.queues import AsyncMessageClient
 from penumbra.recent import RecentlySent
 
@@ -29,6 +28,26 @@ settings = Settings()
 recently_sent = RecentlySent(
     settings.recently_sent_max_size, settings.recently_sent_ttl_seconds
 )
+
+
+# Every distinct UA is a Prometheus series for the life of the process. Heritrix
+# sends one per crawl job, so a handful is normal; past this many, the sender is
+# varying it and the rest are counted together as "other".
+MAX_USER_AGENT_LABELS = 20
+labelled_user_agents: set[str] = set()
+
+
+def user_agent_label(user_agent: str | None) -> str:
+    """The `user_agent` label for a page crawled with `user_agent`."""
+    if user_agent is None:
+        return "default"
+    if user_agent in labelled_user_agents:
+        return user_agent
+    if len(labelled_user_agents) >= MAX_USER_AGENT_LABELS:
+        return "other"
+    labelled_user_agents.add(user_agent)
+    logger.info("Crawling with user agent from Heritrix: %s", user_agent)
+    return user_agent
 
 
 class InstanceStalled(Exception):
@@ -113,6 +132,20 @@ async def publish_with_retry(
     return False
 
 
+def excluded_host(url: str) -> str | None:
+    """The URL's host if it is in `excluded_outlink_hosts`, otherwise None."""
+    if not settings.excluded_outlink_hosts:
+        return None
+    try:
+        hostname = urlsplit(url).hostname
+    except ValueError:
+        return None
+    if hostname is None:
+        return None
+    host = normalize_host(hostname)
+    return host if host in settings.excluded_outlink_hosts else None
+
+
 @time(metrics.penumbra_url_publishing_duration_seconds)
 async def publish_umbra_response(
     client: AsyncMessageClient, parent_message: UmbraMessage, urls: set[str]
@@ -131,6 +164,10 @@ async def publish_umbra_response(
                     "Dropping over-length URL (%d chars): %.200s...", len(url), url
                 )
                 metrics.penumbra_urls_dropped_too_long.inc(1)
+                continue
+            host = excluded_host(url)
+            if host is not None:
+                metrics.penumbra_urls_dropped_excluded_host.labels(host).inc(1)
                 continue
             key = (parent_message.client_id, url)
             repeat = key in recently_sent
@@ -470,6 +507,9 @@ async def process_page(
     deadline = asyncio.timeout(settings.browser_deadline_seconds)
     try:
         async with deadline:
+            metrics.penumbra_pages_user_agent.labels(
+                user_agent_label(message.metadata.user_agent)
+            ).inc(1)
             context = await browser.new_context(
                 accept_downloads=False,
                 user_agent=message.metadata.user_agent,
@@ -620,6 +660,15 @@ async def main():
     # Setup metrics
     if settings.metrics_enabled:
         metrics.register_prom_metrics(settings.metrics_port)
+        # One series per configured host from startup, so a rate is 0, not absent.
+        for host in settings.excluded_outlink_hosts:
+            metrics.penumbra_urls_dropped_excluded_host.labels(host)
+    # Logged so a deploy shows the list it actually loaded.
+    logger.info(
+        "Excluding outlinks to %d host(s): %s",
+        len(settings.excluded_outlink_hosts),
+        ", ".join(sorted(settings.excluded_outlink_hosts)) or "none",
+    )
 
     # Setup RabbitMQ client. Prefetch is capped at the number of page tasks we
     # can actually run, so undelivered work stays queued in the broker where it
