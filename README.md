@@ -91,6 +91,7 @@ page's Heritrix `clientId`.
 | `PENUMBRA_RECENTLY_SENT_MAX_SIZE` | `200000` | URLs remembered as already published, per process. `0` disables. |
 | `PENUMBRA_RECENTLY_SENT_TTL_SECONDS` | `14400` | How long a published URL counts as recent, measured from when it was first sent. |
 | `PENUMBRA_RECENTLY_SENT_ENFORCE` | `false` | Drop URLs already published for the same `clientId` within the TTL. Off, they are only counted in `penumbra_urls_recently_sent`. Heritrix would discard them anyway. |
+| `PENUMBRA_EXCLUDED_OUTLINK_HOSTS` | empty | Hostnames whose URLs are never published as outlinks, separated by commas and/or whitespace, e.g. `www.example.com,cdn.example.net`. Matched exactly and case-insensitively against the URL's host, ignoring the port: `www.example.com` does not exclude `example.com`. Dropped URLs are counted in `penumbra_urls_dropped_excluded_host` by host. The browser still fetches them; this only stops them going back to Heritrix. A URL or `host:port` here is a startup error. |
 
 ### Health and shutdown
 

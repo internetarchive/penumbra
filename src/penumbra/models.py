@@ -1,9 +1,15 @@
+import re
 from dataclasses import asdict, dataclass
 from functools import cached_property
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, computed_field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+
+def normalize_host(host: str) -> str:
+    """Lowercase, and drop the trailing dot of a fully qualified name."""
+    return host.strip().lower().rstrip(".")
 
 
 class Settings(BaseSettings):
@@ -43,6 +49,13 @@ class Settings(BaseSettings):
     recently_sent_ttl_seconds: float = Field(default=4 * 3600.0, gt=0)
     # Off: repeats are only counted. On: they are not published.
     recently_sent_enforce: bool = Field(default=False)
+    # Hostnames whose URLs are never returned to Heritrix as outlinks, e.g.
+    # trackers and tag managers. Exact, case-insensitive match on the host:
+    # `www.example.com` does not exclude `example.com`.
+    # From the environment, a comma- and/or whitespace-separated list.
+    excluded_outlink_hosts: Annotated[frozenset[str], NoDecode] = Field(
+        default=frozenset()
+    )
     # Time to wait for a server to respond to the initial request
     navigation_timeout_seconds: float = Field(default=30.0, gt=0)
     # Time to wait for a page to be considered finished requestion resources. After this,
@@ -80,6 +93,24 @@ class Settings(BaseSettings):
     @classmethod
     def blank_is_unset(cls, value: str | None) -> str | None:
         return (value or "").strip() or None
+
+    @field_validator("excluded_outlink_hosts", mode="before")
+    @classmethod
+    def parse_hosts(cls, value: object) -> frozenset[str]:
+        if isinstance(value, str):
+            value = re.split(r"[\s,]+", value)
+        hosts = set()
+        for entry in value:
+            host = normalize_host(entry)
+            if not host:
+                continue
+            # A URL or host:port here would silently match nothing.
+            if any(c in host for c in "/:@?#"):
+                raise ValueError(
+                    f"excluded_outlink_hosts takes bare hostnames, not {entry!r}"
+                )
+            hosts.add(host)
+        return frozenset(hosts)
 
     @computed_field
     @cached_property
